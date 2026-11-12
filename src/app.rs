@@ -673,6 +673,7 @@ impl App {
                     .id_salt("games")
                     .max_height((ui.available_height() - 55.0).max(100.0))
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
                         if rows.is_empty() && !self.searching {
                             ui.add_space(24.0);
                             ui.label(if self.page.as_ref().is_some_and(|p| p.all > 0) {
@@ -683,36 +684,7 @@ impl App {
                         }
                         for row in rows {
                             let selected = self.loaded.as_ref().is_some_and(|g| g.id == row.id);
-                            let name = |s: &str| {
-                                if s.is_empty() {
-                                    "?".to_owned()
-                                } else {
-                                    s.to_owned()
-                                }
-                            };
-                            let title = format!(
-                                "{}{}  —  {}",
-                                if row.starred { "★ " } else { "" },
-                                name(&row.white),
-                                name(&row.black)
-                            );
-                            let mut text = egui::text::LayoutJob::default();
-                            let mut add = |s: &str, size: f32, color: Color32| {
-                                text.append(s, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), color));
-                            };
-                            add(&format!("{title}\n"), 13.0, INK);
-                            add(&format!("{}\n", event_name(&row.event)), 12.0, MUTED);
-                            if let Some(date) = pretty_date(&row.date) {
-                                add(&format!("📆 {date}     "), 13.0, GREEN);
-                            }
-                            add(&format!("{}   {}", row.result, row.eco), 13.0, INK);
-                            let response = ui.add_sized(
-                                [ui.available_width(), 76.0],
-                                egui::Button::new(text)
-                                    .wrap()
-                                    .selected(selected)
-                                    .frame(selected),
-                            );
+                            let response = game_card(ui, &row, selected);
                             if response.clicked() {
                                 self.select(row.id);
                             }
@@ -726,7 +698,6 @@ impl App {
                                     ui.close();
                                 }
                             });
-                            ui.separator();
                         }
                     });
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -2562,6 +2533,142 @@ mod tests {
             }),
             Square::C8
         );
+    }
+}
+
+fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Response {
+    let white = if row.white.is_empty() {
+        "?"
+    } else {
+        &row.white
+    };
+    let black = if row.black.is_empty() {
+        "?"
+    } else {
+        &row.black
+    };
+    let event = event_name(&row.event);
+    let date = pretty_date(&row.date);
+    let metadata = [date.as_deref(), Some(row.eco.as_str())]
+        .into_iter()
+        .flatten()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    let width = ui.available_width();
+    let painter = ui.painter().clone();
+    let layout = |text: &str, size, color, max_width, max_rows| {
+        let mut job = egui::text::LayoutJob::single_section(
+            text.to_owned(),
+            egui::TextFormat::simple(egui::FontId::proportional(size), color),
+        );
+        job.wrap.max_width = max_width;
+        job.wrap.max_rows = max_rows;
+        job.break_on_newline = false;
+        painter.layout_job(job)
+    };
+    let event_line = layout(event, 11.5, MUTED, width - 26.0, 2);
+    let metadata_height = if metadata.is_empty() { 0.0 } else { 16.0 };
+    let (_, rect) = ui.allocate_space(Vec2::new(
+        width,
+        50.0 + event_line.size().y + metadata_height,
+    ));
+    let response = ui.interact(rect, ui.make_persistent_id(row.id), egui::Sense::click());
+    let details = || {
+        format!(
+            "{}White: {white}\nBlack: {black}\n{event}\n{metadata}\n{}",
+            if row.starred { "Favourite\n" } else { "" },
+            row.result,
+        )
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            details(),
+        )
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let sage = Color32::from_rgb(106, 135, 108);
+    let (fill, border) = if selected {
+        (Color32::from_rgb(221, 231, 210), sage)
+    } else if response.hovered() {
+        (Color32::from_rgb(255, 249, 238), BEVEL)
+    } else {
+        (PAPER, FOLD)
+    };
+    let border = if response.has_focus() { GREEN } else { border };
+    painter.rect(
+        rect,
+        7,
+        fill,
+        egui::Stroke::new(1.0_f32, border),
+        egui::StrokeKind::Inside,
+    );
+    if selected {
+        let accent = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            Vec2::new(3.0, rect.height() - 16.0),
+        );
+        painter.rect_filled(accent, 2, GREEN);
+    }
+
+    let left = rect.left() + 13.0;
+    let mut right = rect.right() - 13.0;
+    let matchup_y = rect.top() + 24.0;
+    if row.starred {
+        painter.text(
+            egui::pos2(right, matchup_y),
+            egui::Align2::RIGHT_CENTER,
+            "★",
+            egui::FontId::proportional(13.0),
+            RIBBON,
+        );
+        right -= 20.0;
+    }
+    let mut truncated = event_line.elided;
+    if !row.result.is_empty() && row.result != "*" {
+        let score = layout(&row.result, 12.0, GREEN, 54.0, 1);
+        truncated |= score.elided;
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(right - score.size().x - 14.0, matchup_y - 10.0),
+            Vec2::new(score.size().x + 14.0, 20.0),
+        );
+        let badge_fill = if selected {
+            Color32::from_rgb(199, 215, 187)
+        } else {
+            Color32::from_rgb(234, 223, 203)
+        };
+        painter.rect_filled(badge, 5, badge_fill);
+        painter.galley(badge.center() - score.size() / 2.0, score, GREEN);
+        right = badge.left() - 9.0;
+    }
+    for (name, y, marker) in [
+        (white, matchup_y - 9.0, PAPER),
+        (black, matchup_y + 9.0, GREEN),
+    ] {
+        let center = egui::pos2(left + 4.0, y);
+        painter.circle(center, 3.4, marker, egui::Stroke::new(1.0_f32, sage));
+        let name = layout(name, 13.5, INK, right - left - 16.0, 1);
+        truncated |= name.elided;
+        painter.galley(egui::pos2(left + 16.0, y - name.size().y / 2.0), name, INK);
+    }
+    let event_pos = egui::pos2(left, rect.top() + 42.0);
+    let metadata_y = event_pos.y + event_line.size().y + 3.0;
+    painter.galley(event_pos, event_line, MUTED);
+    if !metadata.is_empty() {
+        let line = layout(&metadata, 11.0, GREEN, width - 26.0, 1);
+        truncated |= line.elided;
+        painter.galley(egui::pos2(left, metadata_y), line, GREEN);
+    }
+    if truncated {
+        response.on_hover_text(details())
+    } else {
+        response
     }
 }
 
