@@ -17,7 +17,7 @@ The toolchain file selects native Apple Silicon Rust. On Intel, use an installed
 
 ## Use it
 
-- **Import PGN** or **⌘O** opens one or more files; dropping PGNs into the window also imports them. The sample button adds Morphy's Opera Game.
+- **Import PGN** or **⌘O** opens one or more files; dropping PGNs into the window also imports them, and **⌘V** outside a text field imports PGN text from the clipboard (listed under the source `chesslib-paste.pgn`). The sample button adds Morphy's Opera Game.
 - Search players, event names, dates, ECO codes, imported comments, and your notes. Search is case-insensitive, matches word prefixes, and requires all entered words. It is not an arbitrary substring search.
 - Narrow the library by source PGN filename or favourites. Results are paged, newest imports first.
 - Select a game, click a move, or use **← / →**, **↑ / ↓** or **Home / End**. Navigation follows the current line. Flip the board (**F**) or copy the current FEN. **L** toggles continuous analysis. Drag the rule under the move list to resize it.

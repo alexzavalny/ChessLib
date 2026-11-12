@@ -1720,6 +1720,17 @@ impl eframe::App for App {
         if !drops.is_empty() {
             self.import_files(drops, ctx);
         }
+        // ⌘V outside a text field imports pasted PGN; the importer reads files, so stage it in one.
+        let pasted = if ctx.wants_keyboard_input() || self.importing { None } else {
+            ctx.input(|i| i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            }))
+        };
+        if let Some(text) = pasted {
+            let path = std::env::temp_dir().join("chesslib-paste.pgn");
+            match std::fs::write(&path, text) { Ok(()) => self.import_files(vec![path], ctx), Err(e) => self.error = Some(e.to_string()) }
+        }
         let cloth = self.bookcloth.clone();
         egui::TopBottomPanel::top("toolbar")
             .show_separator_line(false)
