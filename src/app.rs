@@ -649,26 +649,25 @@ impl App {
                         .iter()
                         .filter(|e| e.name.to_lowercase().contains(&needle))
                         .collect();
-                    ui.small(format!("{} events", shown.len()));
+                    ui.small(match shown.len() {
+                        0 if events.is_empty() => "No events yet.".into(),
+                        0 => "No matching events.".into(),
+                        1 => "1 event".into(),
+                        count => format!("{count} events"),
+                    });
                     let mut chosen = None;
-                    egui::ScrollArea::vertical().id_salt("events").show_rows(ui, 44.0, shown.len(), |ui, range| {
-                        for event in &shown[range] {
-                            let date = |d: &Option<String>| d.as_deref().and_then(pretty_date);
-                            let dates = match (date(&event.first), date(&event.last)) {
-                                (Some(first), Some(last)) if first != last => format!("📆 {first} – {last}"),
-                                (Some(date), _) => format!("📆 {date}"),
-                                _ => "Date unknown".into(),
-                            };
-                            let games = if event.games == 1 { "1 game".into() } else { format!("{} games", event.games) };
-                            let text = format!("{}\n{dates} · {games}", event_name(&event.name));
-                            let selected = self.filter.event.as_ref() == Some(&event.name);
-                            if ui
-                                .add_sized([ui.available_width(), 44.0], egui::Button::new(RichText::new(text).size(13.0)).wrap().selected(selected).frame(selected))
-                                .clicked()
-                            {
-                                chosen = Some(event.name.clone());
-                            }
-                        }
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        egui::ScrollArea::vertical().id_salt("events").show_rows(
+                            ui, EVENT_CARD_HEIGHT, shown.len(), |ui, range| {
+                                for event in &shown[range] {
+                                    let selected = self.filter.event.as_ref() == Some(&event.name);
+                                    if event_card(ui, event, selected).clicked() {
+                                        chosen = Some(event.name.clone());
+                                    }
+                                }
+                            },
+                        );
                     });
                     if let Some(name) = chosen {
                         self.filter.event = Some(name);
@@ -2587,6 +2586,122 @@ mod tests {
     }
 }
 
+const EVENT_CARD_HEIGHT: f32 = 64.0;
+const CARD_SAGE: Color32 = Color32::from_rgb(106, 135, 108);
+
+fn event_card(ui: &mut egui::Ui, event: &library::EventRow, selected: bool) -> egui::Response {
+    let name = event_name(&event.name);
+    let first = event.first.as_deref().and_then(pretty_date);
+    let last = event.last.as_deref().and_then(pretty_date);
+    let dates = match (first, last) {
+        (Some(first), Some(last)) if first != last => format!("{first} – {last}"),
+        (Some(date), _) | (_, Some(date)) => date,
+        _ => "Date unknown".into(),
+    };
+    let unit = if event.games == 1 { "game" } else { "games" };
+    let count = format!("{} {unit}", event.games);
+    let details = || format!("{name}\n{dates} · {count}");
+    let width = ui.available_width();
+    let (_, rect) = ui.allocate_space(Vec2::new(width, EVENT_CARD_HEIGHT));
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("event", &event.name)),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            details(),
+        )
+    });
+    let painter = ui.painter();
+    paint_list_card(painter, &response, selected);
+    let left = rect.left() + 13.0;
+    let title = card_text(painter, name, 13.5, INK, width - 26.0, 2);
+    let title_elided = title.elided;
+    painter.galley(egui::pos2(left, rect.top() + 8.0), title, INK);
+
+    let count = card_text(painter, &count, 11.0, GREEN, 100.0, 1);
+    let badge = paint_card_badge(
+        painter,
+        egui::pos2(rect.right() - 13.0, rect.bottom() - 15.0),
+        count,
+        selected,
+    );
+    let date = card_text(painter, &dates, 11.0, GREEN, badge.left() - left - 8.0, 1);
+    let date_elided = date.elided;
+    painter.galley(egui::pos2(left, badge.center().y - date.size().y / 2.0), date, GREEN);
+    if title_elided || date_elided {
+        response.on_hover_text(details())
+    } else {
+        response
+    }
+}
+
+fn card_text(
+    painter: &egui::Painter,
+    text: &str,
+    size: f32,
+    color: Color32,
+    max_width: f32,
+    max_rows: usize,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat::simple(egui::FontId::proportional(size), color),
+    );
+    job.wrap.max_width = max_width;
+    job.wrap.max_rows = max_rows;
+    job.break_on_newline = false;
+    painter.layout_job(job)
+}
+
+fn paint_list_card(painter: &egui::Painter, response: &egui::Response, selected: bool) {
+    let rect = response.rect;
+    let (fill, border) = if selected {
+        (Color32::from_rgb(221, 231, 210), CARD_SAGE)
+    } else if response.hovered() {
+        (Color32::from_rgb(255, 249, 238), BEVEL)
+    } else {
+        (PAPER, FOLD)
+    };
+    let border = if response.has_focus() { GREEN } else { border };
+    painter.rect(
+        rect,
+        7,
+        fill,
+        egui::Stroke::new(1.0_f32, border),
+        egui::StrokeKind::Inside,
+    );
+    if selected {
+        let accent = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            Vec2::new(3.0, rect.height() - 16.0),
+        );
+        painter.rect_filled(accent, 2, GREEN);
+    }
+}
+
+fn paint_card_badge(
+    painter: &egui::Painter,
+    right_center: egui::Pos2,
+    text: Arc<egui::Galley>,
+    selected: bool,
+) -> egui::Rect {
+    let size = Vec2::new(text.size().x + 14.0, 20.0);
+    let badge = egui::Rect::from_min_size(right_center - Vec2::new(size.x, size.y / 2.0), size);
+    let fill = if selected {
+        Color32::from_rgb(199, 215, 187)
+    } else {
+        Color32::from_rgb(234, 223, 203)
+    };
+    painter.rect_filled(badge, 5, fill);
+    painter.galley(badge.center() - text.size() / 2.0, text, GREEN);
+    badge
+}
+
 fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Response {
     let white = if row.white.is_empty() {
         "?"
@@ -2608,15 +2723,8 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         .join("  ·  ");
     let width = ui.available_width();
     let painter = ui.painter().clone();
-    let layout = |text: &str, size, color, max_width, max_rows| {
-        let mut job = egui::text::LayoutJob::single_section(
-            text.to_owned(),
-            egui::TextFormat::simple(egui::FontId::proportional(size), color),
-        );
-        job.wrap.max_width = max_width;
-        job.wrap.max_rows = max_rows;
-        job.break_on_newline = false;
-        painter.layout_job(job)
+    let layout = |text, size, color, max_width, max_rows| {
+        card_text(&painter, text, size, color, max_width, max_rows)
     };
     let event_line = layout(event, 11.5, MUTED, width - 26.0, 2);
     let metadata_height = if metadata.is_empty() { 0.0 } else { 16.0 };
@@ -2644,29 +2752,7 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         return response;
     }
 
-    let sage = Color32::from_rgb(106, 135, 108);
-    let (fill, border) = if selected {
-        (Color32::from_rgb(221, 231, 210), sage)
-    } else if response.hovered() {
-        (Color32::from_rgb(255, 249, 238), BEVEL)
-    } else {
-        (PAPER, FOLD)
-    };
-    let border = if response.has_focus() { GREEN } else { border };
-    painter.rect(
-        rect,
-        7,
-        fill,
-        egui::Stroke::new(1.0_f32, border),
-        egui::StrokeKind::Inside,
-    );
-    if selected {
-        let accent = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 2.0, rect.center().y),
-            Vec2::new(3.0, rect.height() - 16.0),
-        );
-        painter.rect_filled(accent, 2, GREEN);
-    }
+    paint_list_card(&painter, &response, selected);
 
     let left = rect.left() + 13.0;
     let mut right = rect.right() - 13.0;
@@ -2685,17 +2771,7 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
     if !row.result.is_empty() && row.result != "*" {
         let score = layout(&row.result, 12.0, GREEN, 54.0, 1);
         truncated |= score.elided;
-        let badge = egui::Rect::from_min_size(
-            egui::pos2(right - score.size().x - 14.0, matchup_y - 10.0),
-            Vec2::new(score.size().x + 14.0, 20.0),
-        );
-        let badge_fill = if selected {
-            Color32::from_rgb(199, 215, 187)
-        } else {
-            Color32::from_rgb(234, 223, 203)
-        };
-        painter.rect_filled(badge, 5, badge_fill);
-        painter.galley(badge.center() - score.size() / 2.0, score, GREEN);
+        let badge = paint_card_badge(&painter, egui::pos2(right, matchup_y), score, selected);
         right = badge.left() - 9.0;
     }
     for (name, y, marker) in [
@@ -2703,7 +2779,7 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         (black, matchup_y + 9.0, GREEN),
     ] {
         let center = egui::pos2(left + 4.0, y);
-        painter.circle(center, 3.4, marker, egui::Stroke::new(1.0_f32, sage));
+        painter.circle(center, 3.4, marker, egui::Stroke::new(1.0_f32, CARD_SAGE));
         let name = layout(name, 13.5, INK, right - left - 16.0, 1);
         truncated |= name.elided;
         painter.galley(egui::pos2(left + 16.0, y - name.size().y / 2.0), name, INK);
