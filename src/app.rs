@@ -1919,6 +1919,15 @@ impl eframe::App for App {
                 self.analysis = None;
                 self.analysis_error = None;
             }
+            // Space plays the engine's top move, like "Play best", while analysis runs outside play/training.
+            if plain(egui::Key::Space)
+                && self.play.is_none()
+                && self.analysis.is_some()
+                && !self.loading
+                && let Some(best) = self.lines.first().and_then(|e| e.best)
+            {
+                self.play(best);
+            }
         }
         if !ctx.wants_keyboard_input()
             && let Some(replay) = &self.replay
