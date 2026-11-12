@@ -17,8 +17,18 @@ use std::{
     },
     time::{Duration, Instant},
 };
-const GREEN: Color32 = Color32::from_rgb(91, 134, 109);
-const INK: Color32 = Color32::from_rgb(35, 43, 42);
+// Palette sampled from the app icon; see docs/design.md.
+const CLOTH: Color32 = Color32::from_rgb(23, 62, 33);
+const GREEN: Color32 = Color32::from_rgb(37, 72, 48);
+const CLOTH_SHADOW: Color32 = Color32::from_rgb(5, 35, 14);
+const PAPER: Color32 = Color32::from_rgb(247, 236, 221);
+const IVORY: Color32 = Color32::from_rgb(245, 233, 214);
+const FOLD: Color32 = Color32::from_rgb(203, 185, 155);
+const BEVEL: Color32 = Color32::from_rgb(189, 165, 129);
+const RIBBON: Color32 = Color32::from_rgb(205, 76, 5);
+const RIBBON_LIGHT: Color32 = Color32::from_rgb(239, 116, 33);
+const INK: Color32 = Color32::from_rgb(38, 40, 32);
+const MUTED: Color32 = Color32::from_rgb(112, 100, 80);
 
 pub struct App {
     db: rusqlite::Connection,
@@ -69,12 +79,40 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, db: rusqlite::Connection) -> Self {
         let ctx = &cc.egui_ctx;
-        ctx.set_visuals(egui::Visuals::light());
+        // Pin light: style() and set_style() act on the active theme, so a dark-mode Mac
+        // would otherwise receive this styling in the unused slot.
+        ctx.set_theme(egui::ThemePreference::Light);
         let mut style = (*ctx.style()).clone();
-        style.visuals.panel_fill = Color32::from_rgb(247, 247, 243);
-        style.visuals.override_text_color = Some(INK);
-        style.visuals.selection.bg_fill = Color32::from_rgb(216, 233, 220);
-        style.visuals.selection.stroke.color = INK;
+        let v = &mut style.visuals;
+        v.panel_fill = PAPER;
+        v.override_text_color = Some(INK);
+        v.selection.bg_fill = Color32::from_rgb(208, 220, 188);
+        v.selection.stroke = egui::Stroke::new(1.0_f32, GREEN);
+        v.hyperlink_color = RIBBON;
+        v.faint_bg_color = Color32::from_rgb(240, 228, 208);
+        v.extreme_bg_color = Color32::from_rgb(253, 248, 238);
+        v.window_fill = PAPER;
+        v.window_stroke = egui::Stroke::new(1.0_f32, BEVEL);
+        v.window_corner_radius = egui::CornerRadius::same(8);
+        v.window_shadow = egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(70) };
+        v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(50) };
+        // Ivory keys with a carved bevel edge; pressed keys sink into the fold shadow.
+        let w = &mut v.widgets;
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, FOLD);
+        w.inactive.weak_bg_fill = Color32::from_rgb(250, 243, 231);
+        w.inactive.bg_fill = Color32::from_rgb(236, 224, 204);
+        w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BEVEL);
+        w.hovered.weak_bg_fill = Color32::from_rgb(255, 250, 240);
+        w.hovered.bg_fill = Color32::from_rgb(240, 229, 210);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(160, 136, 100));
+        w.active.weak_bg_fill = Color32::from_rgb(228, 213, 188);
+        w.active.bg_fill = FOLD;
+        w.active.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(140, 116, 82));
+        w.open.weak_bg_fill = Color32::from_rgb(240, 229, 210);
+        w.open.bg_stroke = egui::Stroke::new(1.0_f32, BEVEL);
+        for state in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            state.corner_radius = egui::CornerRadius::same(6);
+        }
         style.spacing.item_spacing = Vec2::new(10.0, 10.0);
         style.spacing.button_padding = Vec2::new(12.0, 7.0);
         style
@@ -367,15 +405,20 @@ impl App {
         }
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
+        let cloth = self.bookcloth.clone();
         egui::SidePanel::left("library")
             .exact_width(302.0)
             .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(236, 239, 233))
-                    .inner_margin(18),
-            )
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(IVORY).inner_margin(18))
             .show(ctx, |ui| {
+                // Carved ivory leaf, set slightly below the cover with a fold at its spine edge.
+                let rect = ui.max_rect().expand(18.0);
+                material(ui.painter(), &cloth, rect, Color32::from_rgb(240, 227, 206), 300.0);
+                top_shadow(ui.painter(), rect, 8);
+                for (i, alpha) in [70u8, 35, 15].into_iter().enumerate() {
+                    ui.painter().vline(rect.right() - 0.5 - i as f32, rect.y_range(), egui::Stroke::new(1.0_f32, Color32::from_black_alpha(alpha)));
+                }
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new("YOUR LIBRARY")
@@ -490,16 +533,19 @@ impl App {
                                 "{title}\n{} · {}\n{}   {}",
                                 row.event, row.date, row.result, row.eco
                             );
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 76.0],
-                                    egui::Button::new(RichText::new(text).size(13.0))
-                                        .wrap()
-                                        .selected(selected)
-                                        .frame(selected),
-                                )
-                                .clicked()
-                            {
+                            let response = ui.add_sized(
+                                [ui.available_width(), 76.0],
+                                egui::Button::new(RichText::new(text).size(13.0))
+                                    .wrap()
+                                    .selected(selected)
+                                    .frame(selected),
+                            );
+                            if selected {
+                                // A ribbon marks the open game, like a bookmark between pages.
+                                let r = response.rect;
+                                ribbon(ui.painter(), &cloth, r.left() + 12.0, r.top(), Vec2::new(11.0, 22.0));
+                            }
+                            if response.clicked() {
                                 self.select(row.id);
                             }
                             ui.separator();
@@ -816,11 +862,21 @@ impl App {
     }
 
     fn notebook(&mut self, ctx: &egui::Context) {
+        let cloth = self.bookcloth.clone();
         egui::SidePanel::right("notebook")
             .exact_width(310.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(16))
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(PAPER).inner_margin(16))
             .show(ctx, |ui| {
+                // The study notebook: a lighter paper page with a gutter shadow and a bookmark ribbon.
+                let rect = ui.max_rect().expand(16.0);
+                material(ui.painter(), &cloth, rect, Color32::from_rgb(252, 244, 232), 300.0);
+                top_shadow(ui.painter(), rect, 8);
+                for (i, alpha) in [80u8, 40, 20, 8].into_iter().enumerate() {
+                    ui.painter().vline(rect.left() + 0.5 + i as f32, rect.y_range(), egui::Stroke::new(1.0_f32, Color32::from_black_alpha(alpha)));
+                }
+                ribbon(ui.painter(), &cloth, rect.right() - 46.0, rect.top(), Vec2::new(18.0, 52.0));
                 egui::ScrollArea::vertical()
                     .id_salt("study-desk")
                     .show(ui, |ui| {
@@ -926,16 +982,33 @@ impl App {
                         ui.label(RichText::new(title).strong());
                         if let Some(loaded) = &mut self.loaded {
                             let note = loaded.notes.entry(self.current).or_default();
-                            if ui
-                                .add(
-                                    egui::TextEdit::multiline(note)
-                                        .id_salt((loaded.id, self.current))
-                                        .hint_text("Plans, ideas, things to remember…")
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(4),
-                                )
-                                .changed()
-                            {
+                            let sheet = ui.painter().add(egui::Shape::Noop);
+                            let response = ui.add(
+                                egui::TextEdit::multiline(note)
+                                    .id_salt((loaded.id, self.current))
+                                    .hint_text("Plans, ideas, things to remember…")
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(5)
+                                    .frame(false)
+                                    .margin(egui::Margin { left: 14, right: 6, top: 4, bottom: 4 }),
+                            );
+                            // Ruled notepaper behind the text: rules sit on each text baseline.
+                            let rect = response.rect;
+                            let row = ui.fonts_mut(|f| f.row_height(&egui::TextStyle::Body.resolve(ui.style())));
+                            let focused = response.has_focus();
+                            let mut shapes = vec![
+                                egui::Shape::rect_filled(rect, 4, ui.visuals().extreme_bg_color),
+                                egui::Shape::vline(rect.left() + 9.5, rect.y_range(), egui::Stroke::new(1.0_f32, RIBBON.gamma_multiply(0.45))),
+                            ];
+                            let mut y = rect.top() + 4.0 + row;
+                            while y < rect.bottom() - 2.0 {
+                                shapes.push(egui::Shape::hline(rect.x_range().shrink(2.0), y.round() + 0.5, egui::Stroke::new(1.0_f32, FOLD.gamma_multiply(0.7))));
+                                y += row;
+                            }
+                            shapes.push(egui::Shape::rect_stroke(rect, 4, egui::Stroke::new(1.0_f32, if focused { GREEN } else { BEVEL }), egui::StrokeKind::Inside));
+                            ui.painter().set(sheet, egui::Shape::Vec(shapes));
+                            top_shadow(ui.painter(), rect.shrink(1.0), 3);
+                            if response.changed() {
                                 self.dirty = true;
                                 self.edited = Instant::now();
                             }
@@ -979,13 +1052,17 @@ impl App {
             });
     }
     fn board(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(247,247,243)).inner_margin(24)).show(ctx,|ui| {
+        let cloth = self.bookcloth.clone();
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(PAPER).inner_margin(24)).show(ctx,|ui| {
+            let desk = ui.max_rect().expand(24.0);
+            material(ui.painter(), &cloth, desk, PAPER, 300.0);
+            top_shadow(ui.painter(), desk, 10);
             if self.loaded.is_none() {
                 ui.add_space(60.0);
                 ui.label(RichText::new("Every game has\nsomething to teach.").size(34.0).strong());
                 ui.add_space(16.0); ui.label("Bring your games together. Revisit the critical\npositions. Keep your thinking alongside the moves.");
                 ui.add_space(24.0);
-                if ui.add(egui::Button::new(RichText::new("Import PGN files").color(Color32::WHITE)).fill(GREEN)).clicked() { self.choose_import(ctx); }
+                if ui.add(egui::Button::new(RichText::new("Import PGN files").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT))).clicked() { self.choose_import(ctx); }
                 if ui.button("Try a sample game").clicked() {
                     let path = std::env::temp_dir().join("chesslib-sample.pgn");
                     match std::fs::write(&path,include_str!("../fixtures/sample.pgn")) { Ok(()) => self.import_files(vec![path],ctx), Err(e) => self.error=Some(e.to_string()) }
@@ -999,36 +1076,53 @@ impl App {
             ui.label(RichText::new("GAME WORKSPACE").size(11.0).strong().color(GREEN));
             ui.horizontal(|ui| {
                 ui.heading(title);
-                if ui.button(if self.loaded.as_ref().unwrap().starred { "★" } else { "☆" }).on_hover_text("Favourite this game").clicked() {
+                let starred = self.loaded.as_ref().unwrap().starred;
+                if ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
                     let loaded = self.loaded.as_mut().unwrap(); loaded.starred = !loaded.starred; self.dirty=true; self.edited=Instant::now();
                     if self.save() { self.refresh(false); }
                 }
             });
-            ui.label(RichText::new(subtitle).size(13.0).color(Color32::GRAY));
+            ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
             ui.add_space(14.0);
             if self.loading { ui.spinner(); }
             let Some(replay) = &self.replay else { ui.label("Board unavailable for this game. You can still add game notes and export it."); return; };
             let pos = replay.nodes[self.current].position.as_ref().unwrap();
-            let side = (ui.available_width()-64.0).min(ui.available_height()-125.0).max(240.0);
+            // Layout: evaluation bar, a gap, then the clothbound cover with a 22px binding margin
+            // that carries the coordinates around the squares.
+            const BIND: f32 = 22.0;
+            let side = (ui.available_width()-64.0-BIND).min(ui.available_height()-125.0-2.0*BIND).max(240.0);
             let cell = side/8.0;
-            let (rect,_) = ui.allocate_exact_size(Vec2::new(side+64.0,side+22.0),egui::Sense::hover());
-            let origin = rect.min+Vec2::new(64.0,0.0);
+            let (rect,_) = ui.allocate_exact_size(Vec2::new(side+64.0+BIND,side+2.0*BIND),egui::Sense::hover());
+            let origin = rect.min+Vec2::new(64.0,BIND);
+            let squares = egui::Rect::from_min_size(origin, Vec2::splat(side));
+            let cover = squares.expand(BIND);
+            let painter = ui.painter();
+            painter.add(egui::Shadow { offset: [0, 10], blur: 26, spread: 0, color: Color32::from_black_alpha(80) }.as_shape(cover, 6));
+            painter.add(egui::Shadow { offset: [0, 2], blur: 3, spread: 0, color: Color32::from_black_alpha(70) }.as_shape(cover, 6));
+            material(painter, &cloth, cover, CLOTH, 150.0);
+            painter.rect_stroke(cover, 2, egui::Stroke::new(1.0_f32, CLOTH_SHADOW), egui::StrokeKind::Inside);
+            painter.hline(cover.x_range().shrink(2.0), cover.top() + 1.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(28)));
+            // Squares sit in a shallow recess pressed into the cover.
+            painter.rect_stroke(squares, 0, egui::Stroke::new(3.0_f32, CLOTH_SHADOW), egui::StrokeKind::Outside);
+            painter.hline(squares.x_range().expand(3.0), squares.bottom() + 3.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(30)));
             let saved_score = self.loaded.as_ref().and_then(|g| g.game.review.as_ref())
                 .and_then(|report| report.moves.iter().find(|m| m.node == self.current)).map(|m| m.score.as_str());
             let score = self.evaluation.as_ref().map(|e| e.score.as_str()).or(saved_score);
             let evaluation = evaluation_bar_value(pos, score);
-            let bar = egui::Rect::from_min_size(rect.min, Vec2::new(32.0, side));
+            let bar = egui::Rect::from_min_size(egui::pos2(rect.min.x + 4.0, origin.y), Vec2::new(28.0, side));
             let bar_label = evaluation.as_ref().map(|(_, label)| format!("Evaluation: {label}. Positive favours White; negative favours Black."))
                 .unwrap_or_else(|| "No evaluation for this position. Run analysis to see the advantage.".into());
             let response = ui.interact(bar, ui.id().with("evaluation-bar"), egui::Sense::hover());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &bar_label));
             response.on_hover_text(bar_label);
             let painter = ui.painter();
+            // A groove cut into the desk: lit lower edge outside, shadow inside the top.
+            painter.rect_stroke(bar.expand(1.0), 4, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(140)), egui::StrokeKind::Outside);
             if let Some((white_share, label)) = evaluation {
-                painter.rect_filled(bar, 0.0, INK);
+                painter.rect_filled(bar, 0.0, Color32::from_rgb(44, 44, 40));
                 let white_height = bar.height() * white_share;
                 let white_top = if self.flipped { bar.top() } else { bar.bottom() - white_height };
-                painter.rect_filled(egui::Rect::from_min_size(egui::pos2(bar.left(), white_top), Vec2::new(bar.width(), white_height)), 0.0, Color32::from_rgb(250,250,247));
+                painter.rect_filled(egui::Rect::from_min_size(egui::pos2(bar.left(), white_top), Vec2::new(bar.width(), white_height)), 0.0, IVORY);
                 let white_advantage = white_share >= 0.5;
                 let at_top = white_advantage == self.flipped;
                 let label_pos = egui::pos2(bar.center().x, if at_top { bar.top()+12.0 } else { bar.bottom()-12.0 });
@@ -1036,10 +1130,12 @@ impl App {
                 painter.text(label_pos, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(font_size), if white_advantage { INK } else { Color32::WHITE });
                 painter.line_segment([egui::pos2(bar.left(),bar.center().y), egui::pos2(bar.right(),bar.center().y)], egui::Stroke::new(1.0_f32,Color32::from_rgb(150,150,145)));
             } else {
-                painter.rect_filled(bar, 0.0, Color32::from_rgb(220,223,217));
+                painter.rect_filled(bar, 0.0, Color32::from_rgb(232, 218, 194));
                 painter.text(bar.center(), egui::Align2::CENTER_CENTER, "—", egui::FontId::proportional(12.0), INK);
             }
-            painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.0_f32,Color32::from_rgb(170,175,166)), egui::StrokeKind::Inside);
+            top_shadow(painter, bar, 4);
+            painter.vline(bar.left() + 0.5, bar.y_range(), egui::Stroke::new(1.0_f32, Color32::from_black_alpha(40)));
+            painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.0_f32, BEVEL), egui::StrokeKind::Outside);
             let legal = pos.legal_moves();
             let mut clicked = None;
             for row in 0..8 { for col in 0..8 {
@@ -1069,8 +1165,10 @@ impl App {
                 let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click());
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !self.loading, &square_label));
                 if response.on_hover_text(square_label).clicked() { clicked = Some(square); }
-                if col==0 { painter.text(min-Vec2::new(12.0,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),Color32::GRAY); }
-                if row==7 { painter.text(min+Vec2::new(cell/2.0,cell+13.0),egui::Align2::CENTER_CENTER,((b'a'+file as u8) as char).to_string(),egui::FontId::proportional(11.0),Color32::GRAY); }
+                // Coordinates stamped into the cover cloth.
+                let coordinate = Color32::from_rgb(214, 202, 176);
+                if col==0 { painter.text(min-Vec2::new(BIND/2.0+1.5,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),coordinate); }
+                if row==7 { painter.text(min+Vec2::new(cell/2.0,cell+BIND/2.0+1.5),egui::Align2::CENTER_CENTER,((b'a'+file as u8) as char).to_string(),egui::FontId::proportional(11.0),coordinate); }
                 if let Some(piece) = piece {
                     // Shorter pieces sit low in the atlas because the bases share a baseline.
                     let (column, lift) = match piece.role {
@@ -1119,7 +1217,7 @@ impl App {
                 }
             });
             ui.small("Click a piece, then a highlighted square to explore a move.");
-            ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(Color32::GRAY));
+            ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(MUTED));
             if let Some(square) = clicked && !self.loading {
                 if let Some(from) = self.selected_square {
                     let candidates: Vec<_> = legal.iter().copied().filter(|m| m.from() == Some(from) && move_destination(*m) == square).collect();
@@ -1198,32 +1296,37 @@ impl eframe::App for App {
         if !drops.is_empty() {
             self.import_files(drops, ctx);
         }
+        let cloth = self.bookcloth.clone();
         egui::TopBottomPanel::top("toolbar")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(INK)
+                    .fill(CLOTH)
                     .inner_margin(egui::Margin::symmetric(22, 14)),
             )
             .show(ctx, |ui| {
-                ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                let rect = ui.max_rect().expand2(Vec2::new(22.0, 14.0));
+                material(ui.painter(), &cloth, rect, CLOTH, 150.0);
+                // Rounded spine edge: a lit top thread and a deep shadow along the bottom.
+                ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0_f32, GREEN));
+                ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, egui::Stroke::new(2.0_f32, CLOTH_SHADOW));
+                ui.visuals_mut().override_text_color = Some(IVORY);
+                let w = &mut ui.visuals_mut().widgets;
+                w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, CLOTH_SHADOW);
+                w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 120, 96));
+                w.noninteractive.fg_stroke.color = Color32::from_rgb(140, 160, 140);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("♞  CHESSLIB")
-                            .size(19.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
+                    embossed(ui, "♞  CHESSLIB", 19.0, IVORY);
                     ui.label(
                         RichText::new(" /  A personal chess library")
                             .size(12.0)
-                            .color(Color32::from_rgb(170, 187, 175)),
+                            .color(Color32::from_rgb(170, 187, 168)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.exporting,
-                                egui::Button::new("Export results")
-                                    .fill(Color32::from_rgb(57, 69, 64)),
+                                egui::Button::new("Export results").fill(GREEN),
                             )
                             .clicked()
                         {
@@ -1232,8 +1335,7 @@ impl eframe::App for App {
                         if ui
                             .add_enabled(
                                 self.loaded.is_some() && !self.exporting,
-                                egui::Button::new("Export game")
-                                    .fill(Color32::from_rgb(57, 69, 64)),
+                                egui::Button::new("Export game").fill(GREEN),
                             )
                             .clicked()
                         {
@@ -1242,7 +1344,9 @@ impl eframe::App for App {
                         if ui
                             .add_enabled(
                                 !self.importing,
-                                egui::Button::new("+ Import PGN").fill(GREEN),
+                                egui::Button::new(RichText::new("+ Import PGN").color(Color32::WHITE))
+                                    .fill(RIBBON)
+                                    .stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT)),
                             )
                             .clicked()
                         {
@@ -1252,12 +1356,13 @@ impl eframe::App for App {
                 });
             });
         egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(236, 239, 233))
-                    .inner_margin(10),
-            )
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(FOLD).inner_margin(10))
             .show(ctx, |ui| {
+                let rect = ui.max_rect().expand(10.0);
+                material(ui.painter(), &cloth, rect, Color32::from_rgb(232, 216, 190), 300.0);
+                ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0_f32, BEVEL));
+                ui.painter().hline(rect.x_range(), rect.top() + 1.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(90)));
                 ui.horizontal(|ui| {
                     if self.importing {
                         ui.spinner();
@@ -1388,6 +1493,50 @@ fn evaluation_bar_value(position: &shakmaty::Chess, score: Option<&str>) -> Opti
             format!("{pawns:+.1}")
         },
     ))
+}
+
+/// Paints `rect` as a woven material: the near-white bookcloth grain multiplied by `color`.
+/// UVs follow screen position so the grain stays continuous across neighbouring surfaces.
+fn material(painter: &egui::Painter, cloth: &egui::TextureHandle, rect: egui::Rect, color: Color32, weave: f32) {
+    let uv = egui::Rect::from_min_size((rect.min.to_vec2() / weave).to_pos2(), rect.size() / weave);
+    painter.image(cloth.id(), rect, uv, color);
+}
+
+/// Soft shadow falling inward from the top edge, as under a book cover or a lifted page.
+fn top_shadow(painter: &egui::Painter, rect: egui::Rect, depth: u8) {
+    for i in 0..depth {
+        let y = rect.top() + i as f32 + 0.5;
+        let alpha = (36.0 * (1.0 - i as f32 / depth as f32).powi(2)) as u8;
+        painter.hline(rect.x_range(), y, egui::Stroke::new(1.0_f32, Color32::from_black_alpha(alpha)));
+    }
+}
+
+/// Burnt-orange bookmark ribbon with a notched tail, hanging from `top` at `x`.
+fn ribbon(painter: &egui::Painter, cloth: &egui::TextureHandle, x: f32, top: f32, size: Vec2) {
+    let rect = egui::Rect::from_min_size(egui::pos2(x, top), size);
+    let notch = size.x * 0.4;
+    painter.add(
+        egui::Shadow { offset: [1, 3], blur: 6, spread: 0, color: Color32::from_black_alpha(60) }
+            .as_shape(rect.with_max_y(rect.bottom() - notch), 0),
+    );
+    let body = rect.with_max_y(rect.bottom() - notch);
+    material(painter, cloth, body, RIBBON, 60.0);
+    let (l, r, c, b, m) = (rect.left(), rect.right(), rect.center().x, rect.bottom(), body.bottom());
+    // Two tails left by the V-shaped notch (epaint only fills convex polygons).
+    for tail in [[egui::pos2(l, m), egui::pos2(c, m), egui::pos2(l, b)], [egui::pos2(c, m), egui::pos2(r, m), egui::pos2(r, b)]] {
+        painter.add(egui::Shape::convex_polygon(tail.to_vec(), RIBBON, egui::Stroke::NONE));
+    }
+    painter.vline(l + 1.5, top..=b - 2.0, egui::Stroke::new(1.5_f32, RIBBON_LIGHT));
+    painter.vline(r - 1.0, top..=b - 1.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(150, 50, 0)));
+}
+
+/// Text pressed into cloth: a dark offset shadow under a light face.
+fn embossed(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(size), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    ui.painter().galley_with_override_text_color(rect.min + Vec2::new(0.0, 1.0), galley.clone(), CLOTH_SHADOW);
+    ui.painter().galley(rect.min, galley, color);
 }
 
 fn move_destination(movement: Move) -> Square {
