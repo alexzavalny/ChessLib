@@ -21,6 +21,9 @@ pub struct Game {
     pub study: Vec<StudyMove>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<crate::engine::Report>,
+    /// Move nodes the reader bookmarked by double-clicking them in the scoresheet.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub bookmarks: std::collections::BTreeSet<usize>,
     #[serde(skip)]
     bytes: usize,
 }

@@ -903,6 +903,7 @@ impl App {
                 if let Some(replay) = &self.replay {
                     for movement in &report.moves {
                         if movement.node >= replay.nodes.len() { continue; }
+                        // Darker than the board badges so the text stays readable on paper.
                         let color = match movement.quality {
                             engine::Quality::Blunder => Color32::DARK_RED,
                             engine::Quality::Mistake => Color32::from_rgb(180, 90, 15),
@@ -992,6 +993,19 @@ impl App {
                                                 }
                                                 if response.clicked() {
                                                     next = id;
+                                                }
+                                                if let Some(loaded) = &mut self.loaded {
+                                                    if response.double_clicked() {
+                                                        let marks = &mut loaded.game.bookmarks;
+                                                        if !marks.remove(&id) { marks.insert(id); }
+                                                        self.dirty = true;
+                                                        self.edited = Instant::now();
+                                                    }
+                                                    // A ribbon strip inside the move's left padding marks a bookmark.
+                                                    if loaded.game.bookmarks.contains(&id) {
+                                                        let strip = egui::Rect::from_min_size(response.rect.left_top(), Vec2::new(3.0, response.rect.height()));
+                                                        ui.painter().rect_filled(strip, 1, RIBBON);
+                                                    }
                                                 }
                                                 open = half % 2 == 0;
                                                 if !open {
@@ -1176,7 +1190,11 @@ impl App {
             const BIND: f32 = 22.0;
             let side = (ui.available_width()-64.0-BIND).min(ui.available_height()-125.0-2.0*BIND).max(240.0);
             let cell = side/8.0;
-            let (rect,_) = ui.allocate_exact_size(Vec2::new(side+64.0+BIND,side+2.0*BIND),egui::Sense::hover());
+            // Centre the squares in the desk; the evaluation bar hangs to their left, so a narrow window
+            // shifts the board right just enough to keep the bar on screen.
+            let (row,_) = ui.allocate_exact_size(Vec2::new(ui.available_width(),side+2.0*BIND),egui::Sense::hover());
+            let left = (row.center().x - side/2.0 - 64.0).max(row.left());
+            let rect = egui::Rect::from_min_size(egui::pos2(left, row.top()), Vec2::new(side+64.0+BIND,side+2.0*BIND));
             let origin = rect.min+Vec2::new(64.0,BIND);
             let squares = egui::Rect::from_min_size(origin, Vec2::splat(side));
             let cover = squares.expand(BIND);
@@ -1302,7 +1320,7 @@ impl App {
                         drop = true;
                     }
                 }
-                if response.on_hover_text(square_label).clicked() { clicked = Some(square); }
+                if response.clicked() { clicked = Some(square); }
                 // Coordinates stamped into the cover cloth.
                 let coordinate = Color32::from_rgb(214, 202, 176);
                 if col==0 { painter.text(min-Vec2::new(BIND/2.0+1.5,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),coordinate); }
@@ -1318,30 +1336,83 @@ impl App {
             for &(piece, from, to, _) in &sliding {
                 draw_piece(piece, center(from) + (center(to) - center(from)) * progress);
             }
+            // Returns the arrow's tail and the base of its head, for placing a label between them.
+            let arrow = |movement: Move, color: Color32, head: f32, width: f32| {
+                let (start, end) = (center(movement.from().unwrap_or(movement.to())), center(move_destination(movement)));
+                let dir = (end - start).normalized();
+                let normal = dir.rot90();
+                let base = end - dir * head;
+                painter.line_segment([start + dir * cell * 0.2, base], egui::Stroke::new(width, color));
+                painter.add(egui::Shape::convex_polygon(vec![end, base + normal * head * 0.6, base - normal * head * 0.6], color, egui::Stroke::NONE));
+                (start, base)
+            };
+            // Game review verdict on the move just played; for a poor move, also the move the engine preferred.
+            let parse = |before: &shakmaty::Chess, san: &str| san.parse::<shakmaty::san::SanPlus>().ok()?.san.to_move(before).ok();
+            let verdict = self.loaded.as_ref()
+                .and_then(|l| l.game.review.as_ref())
+                .and_then(|r| r.moves.iter().find(|m| m.node == self.current))
+                .zip(replay.nodes[self.current].parent.and_then(|p| replay.nodes[p].position.as_ref()))
+                .and_then(|(review, before)| {
+                    let played = parse(before, &replay.nodes[self.current].san)?;
+                    let suggested = review.best.split_whitespace().next().and_then(|san| parse(before, san)).filter(|&m| m != played);
+                    Some((review.quality, move_destination(played), suggested))
+                });
+            if let Some((quality, _, Some(suggested))) = verdict
+                && matches!(quality, engine::Quality::Inaccuracy | engine::Quality::Mistake | engine::Quality::Blunder)
+            {
+                // Deep bookcloth green reads on both the ivory and the green squares.
+                arrow(suggested, Color32::from_rgba_unmultiplied(CLOTH.r(), CLOTH.g(), CLOTH.b(), 190), cell * 0.32, cell * 0.11);
+            }
             // Engine lines as arrows over the pieces, weakest first so the best sits on top.
             // The legality check guards a stale evaluation.
             for line in self.lines.iter().rev() {
                 let Some(best) = line.best.filter(|m| legal.contains(m)) else { continue };
-                let Some(from) = best.from() else { continue };
-                let (start, end) = (center(from), center(move_destination(best)));
-                let dir = (end - start).normalized();
-                let normal = dir.rot90();
                 let top = line.multipv == 1;
                 let (head, width) = if top { (cell * 0.4, cell * 0.16) } else { (cell * 0.32, cell * 0.11) };
-                let base = end - dir * head;
                 let color = if top { Color32::from_rgba_unmultiplied(40, 110, 200, 180) } else { Color32::from_rgba_unmultiplied(40, 110, 200, 100) };
-                painter.line_segment([start + dir * cell * 0.2, base], egui::Stroke::new(width, color));
-                painter.add(egui::Shape::convex_polygon(vec![end, base + normal * head * 0.6, base - normal * head * 0.6], color, egui::Stroke::NONE));
+                let (start, base) = arrow(best, color, head, width);
                 let galley = painter.layout_no_wrap(line.score.clone(), egui::FontId::proportional((cell * 0.2).clamp(10.0, 14.0)), Color32::WHITE);
                 let label = egui::Rect::from_center_size(start + (base - start) * 0.5, galley.size() + Vec2::new(8.0, 2.0));
                 painter.rect_filled(label, 4, Color32::from_rgba_unmultiplied(25, 70, 140, if top { 230 } else { 190 }));
                 painter.galley(label.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+            }
+            if let Some((quality, square, _)) = verdict {
+                let (color, symbol) = quality_style(quality);
+                let radius = cell * 0.13;
+                let at = center(square) + Vec2::new(cell * 0.5 - radius * 0.9, -cell * 0.5 + radius * 0.9);
+                painter.circle_filled(at + Vec2::new(0.0, 1.5), radius, Color32::from_black_alpha(50));
+                painter.circle(at, radius, color, egui::Stroke::new(1.5_f32, IVORY));
+                // Star and tick are drawn as shapes so they sit exactly in the centre.
+                match quality {
+                    engine::Quality::Best => {
+                        let point = |i: usize, r: f32| {
+                            let angle = std::f32::consts::PI * (i as f32 / 5.0 - 0.5);
+                            at + Vec2::angled(angle) * r + Vec2::new(0.0, radius * 0.06)
+                        };
+                        let (outer, inner) = (radius * 0.62, radius * 0.25);
+                        // A concave star as a convex pentagon plus five point triangles.
+                        painter.add(egui::Shape::convex_polygon((0..5).map(|i| point(2 * i + 1, inner)).collect(), IVORY, egui::Stroke::NONE));
+                        for i in 0..5 {
+                            painter.add(egui::Shape::convex_polygon(vec![point((2 * i + 9) % 10, inner), point(2 * i, outer), point(2 * i + 1, inner)], IVORY, egui::Stroke::NONE));
+                        }
+                    }
+                    engine::Quality::Good => {
+                        let tick = [Vec2::new(-0.42, 0.02), Vec2::new(-0.12, 0.32), Vec2::new(0.42, -0.28)].map(|v| at + v * radius);
+                        painter.add(egui::Shape::line(tick.to_vec(), egui::Stroke::new(radius * 0.2, IVORY)));
+                    }
+                    _ => {
+                        painter.text(at, egui::Align2::CENTER_CENTER, symbol, egui::FontId::proportional(radius * 1.1), IVORY);
+                    }
+                }
             }
             if let Some(piece) = dragged && let Some(p) = ctx.pointer_interact_pos() {
                 draw_piece(piece, p);
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             ui.add_space(8.0);
+            // Controls line up under the board's left edge.
+            let below = egui::Rect::from_min_max(egui::pos2(cover.left(), ui.cursor().top()), ui.max_rect().max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(below), |ui| {
             let line = replay.line(self.current);
             let last = *line.last().unwrap();
             let parent = replay.nodes[self.current].parent;
@@ -1371,6 +1442,7 @@ impl App {
             });
             ui.small("Click or drag a piece to a highlighted square to explore a move.");
             ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(MUTED));
+            });
             if let Some(square) = clicked && !self.loading {
                 if let Some(from) = self.selected_square {
                     let candidates: Vec<_> = legal.iter().copied().filter(|m| m.from() == Some(from) && move_destination(*m) == square).collect();
@@ -1543,10 +1615,6 @@ impl eframe::App for App {
                     } else {
                         ui.small(&self.status);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.small("Saved on this Mac")
-                            .on_hover_text(self.path.display().to_string());
-                    });
                 });
             });
         self.sidebar(ctx);
@@ -1717,6 +1785,18 @@ fn embossed(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) {
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
     ui.painter().galley_with_override_text_color(rect.min + Vec2::new(0.0, 1.0), galley.clone(), CLOTH_SHADOW);
     ui.painter().galley(rect.min, galley, color);
+}
+
+/// Colour and badge symbol for a game-review verdict.
+fn quality_style(quality: engine::Quality) -> (Color32, &'static str) {
+    match quality {
+        // Bookcloth green, muted sage, ochre, ribbon orange and oxblood, after docs/design.md.
+        engine::Quality::Best => (CLOTH, "★"),
+        engine::Quality::Good => (Color32::from_rgb(110, 122, 92), "✔"),
+        engine::Quality::Inaccuracy => (Color32::from_rgb(184, 138, 40), "?!"),
+        engine::Quality::Mistake => (RIBBON, "?"),
+        engine::Quality::Blunder => (Color32::from_rgb(128, 28, 24), "??"),
+    }
 }
 
 fn move_destination(movement: Move) -> Square {
