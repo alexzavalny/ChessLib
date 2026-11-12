@@ -693,6 +693,7 @@ mod tests {
             }],
             milliseconds_per_position: 500,
         });
+        loaded.game.drawings.insert(branch, vec![(12, 28, 'G'), (27, 27, 'R')]);
         save(&db, &loaded).unwrap();
         drop(db);
         let mut db = open(&path).unwrap();
@@ -701,6 +702,7 @@ mod tests {
         let reopened = load(&db, 1).unwrap();
         assert_eq!(reopened.notes[&1], "Existing note");
         assert_eq!(reopened.notes[&branch], "Branch preparation");
+        assert_eq!(reopened.game.drawings[&branch], [(12, 28, 'G'), (27, 27, 'R')]);
         assert_eq!(
             reopened.game.review.as_ref().unwrap().accuracy(true),
             Some(98.0)

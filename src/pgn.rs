@@ -24,6 +24,9 @@ pub struct Game {
     /// Move nodes the reader bookmarked by double-clicking them in the scoresheet.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub bookmarks: std::collections::BTreeSet<usize>,
+    /// Arrows and circles drawn on each move's board: from and to square indices (equal for a circle) and a brush, G, R, B or Y.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drawings: BTreeMap<usize, Vec<(u8, u8, char)>>,
     #[serde(skip)]
     bytes: usize,
 }

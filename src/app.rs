@@ -1644,6 +1644,20 @@ impl App {
                 let top = if piece.color == Color::White { 0.0 } else { 0.5 };
                 (egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5)), lift)
             };
+            let square_at = |p: egui::Pos2| {
+                let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
+                let (f, rk) = if self.flipped { (7 - c, r) } else { (c, 7 - r) };
+                Square::new((rk * 8 + f) as u32)
+            };
+            // Lichess colours: green, Shift red, Option blue, both yellow.
+            let brush = match ctx.input(|i| (i.modifiers.shift, i.modifiers.alt || i.modifiers.ctrl)) {
+                (false, false) => 'G',
+                (true, false) => 'R',
+                (false, true) => 'B',
+                (true, true) => 'Y',
+            };
+            let mut drawn = None;
+            let mut sketch = None;
             let center = |s: Square| {
                 let (file, rank) = (s.file() as usize, s.rank() as usize);
                 let (col, row) = if self.flipped { (7 - file, rank) } else { (file, 7 - rank) };
@@ -1698,18 +1712,23 @@ impl App {
                 let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click_and_drag());
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !self.loading, &square_label));
                 let own_piece = piece.filter(|p| p.color == pos.turn() && can_move);
-                if response.drag_started() && own_piece.is_some() { self.selected_square = Some(square); }
+                let primary = egui::PointerButton::Primary;
+                if response.drag_started_by(primary) && own_piece.is_some() { self.selected_square = Some(square); }
                 if self.selected_square == Some(square) && own_piece.is_some() {
-                    if response.dragged() { dragged = own_piece; }
+                    if response.dragged_by(primary) { dragged = own_piece; }
                     // A drop is handled as a click on the square under the pointer.
-                    if response.drag_stopped() && let Some(p) = ctx.pointer_interact_pos() && squares.contains(p) {
-                        let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
-                        let (f, rk) = if self.flipped { (7 - c, r) } else { (c, 7 - r) };
-                        clicked = Some(Square::new((rk * 8 + f) as u32));
+                    if response.drag_stopped_by(primary) && let Some(p) = ctx.pointer_interact_pos() && squares.contains(p) {
+                        clicked = Some(square_at(p));
                         drop = true;
                     }
                 }
                 if response.clicked() { clicked = Some(square); }
+                let secondary = egui::PointerButton::Secondary;
+                if response.secondary_clicked() { drawn = Some((square, square)); }
+                if let Some(p) = ctx.pointer_interact_pos().filter(|p| squares.contains(*p)) {
+                    if response.dragged_by(secondary) { sketch = Some((square, square_at(p))); }
+                    if response.drag_stopped_by(secondary) { drawn = Some((square, square_at(p))); }
+                }
                 // Coordinates stamped into the cover cloth.
                 let coordinate = Color32::from_rgb(214, 202, 176);
                 if col==0 { painter.text(min-Vec2::new(BIND/2.0+1.5,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),coordinate); }
@@ -1725,15 +1744,32 @@ impl App {
             for &(piece, from, to, _) in &sliding {
                 draw_piece(piece, center(from) + (center(to) - center(from)) * progress);
             }
+            // Drawing the same shape again removes it; a new colour replaces the old one.
+            // Saved with the game per move, so a left click leaves them alone, as in a Lichess study.
+            if let Some((from, to)) = drawn && let Some(loaded) = &mut self.loaded {
+                let (from, to) = (u8::from(from), u8::from(to));
+                let drawings = loaded.game.drawings.entry(self.current).or_default();
+                let existing = drawings.iter().position(|d| (d.0, d.1) == (from, to));
+                match existing.map(|i| drawings.remove(i)) {
+                    Some(old) if old.2 == brush => {}
+                    _ => drawings.push((from, to, brush)),
+                }
+                if drawings.is_empty() { loaded.game.drawings.remove(&self.current); }
+                self.dirty = true;
+                self.edited = Instant::now();
+            }
             // Returns the arrow's tail and the base of its head, for placing a label between them.
-            let arrow = |movement: Move, color: Color32, head: f32, width: f32| {
-                let (start, end) = (center(movement.from().unwrap_or(movement.to())), center(move_destination(movement)));
+            let arrow_between = |from: Square, to: Square, color: Color32, head: f32, width: f32| {
+                let (start, end) = (center(from), center(to));
                 let dir = (end - start).normalized();
                 let normal = dir.rot90();
                 let base = end - dir * head;
                 painter.line_segment([start + dir * cell * 0.2, base], egui::Stroke::new(width, color));
                 painter.add(egui::Shape::convex_polygon(vec![end, base + normal * head * 0.6, base - normal * head * 0.6], color, egui::Stroke::NONE));
                 (start, base)
+            };
+            let arrow = |movement: Move, color: Color32, head: f32, width: f32| {
+                arrow_between(movement.from().unwrap_or(movement.to()), move_destination(movement), color, head, width)
             };
             // Game review verdict on the move just played; for a poor move, also the move the engine preferred.
             let parse = |before: &shakmaty::Chess, san: &str| san.parse::<shakmaty::san::SanPlus>().ok()?.san.to_move(before).ok();
@@ -1764,6 +1800,22 @@ impl App {
                 let label = egui::Rect::from_center_size(start + (base - start) * 0.5, galley.size() + Vec2::new(8.0, 2.0));
                 painter.rect_filled(label, 4, Color32::from_rgba_unmultiplied(25, 70, 140, if top { 230 } else { 190 }));
                 painter.galley(label.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+            }
+            let saved = self.loaded.as_ref().and_then(|l| l.game.drawings.get(&self.current)).map(|d| d.as_slice()).unwrap_or_default();
+            let sketch = sketch.map(|(from, to): (Square, Square)| (u8::from(from), u8::from(to), brush));
+            for &(from, to, brush) in saved.iter().chain(sketch.iter()) {
+                let (from, to) = (Square::new(from.into()), Square::new(to.into()));
+                let color = match brush {
+                    'R' => Color32::from_rgba_unmultiplied(136, 32, 32, 200),
+                    'B' => Color32::from_rgba_unmultiplied(0, 48, 136, 200),
+                    'Y' => Color32::from_rgba_unmultiplied(230, 143, 0, 200),
+                    _ => Color32::from_rgba_unmultiplied(21, 120, 27, 200),
+                };
+                if from == to {
+                    painter.circle_stroke(center(from), cell * 0.46, egui::Stroke::new(cell * 0.07, color));
+                } else {
+                    arrow_between(from, to, color, cell * 0.36, cell * 0.14);
+                }
             }
             if let Some((quality, square, _)) = verdict {
                 let (color, symbol) = quality_style(quality);
