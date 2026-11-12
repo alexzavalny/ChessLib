@@ -1,0 +1,29 @@
+[package]
+name = "chesslib"
+version = "0.1.0"
+edition = "2024"
+description = "A local-first chess library for macOS"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pgn-reader = "0.29.1"
+shakmaty = "0.30.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSSound"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSString", "NSUserDefaults"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+

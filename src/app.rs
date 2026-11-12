@@ -1,0 +1,1507 @@
+use crate::{
+    engine,
+    library::{self, Event, Filter, ImportStats, Loaded, Page, Request},
+    pgn::Replay,
+};
+use eframe::egui::{self, Color32, RichText, Vec2};
+use objc2::{AnyThread, rc::Retained};
+use objc2_app_kit::NSSound;
+use objc2_foundation::{NSData, NSUserDefaults, ns_string};
+use shakmaty::{Color, EnPassantMode, Move, Position, Role, Square, fen::Fen};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
+const GREEN: Color32 = Color32::from_rgb(91, 134, 109);
+const INK: Color32 = Color32::from_rgb(35, 43, 42);
+
+pub struct App {
+    db: rusqlite::Connection,
+    path: PathBuf,
+    requests: mpsc::Sender<Request>,
+    events: mpsc::Sender<Event>,
+    receive: mpsc::Receiver<Event>,
+    filter: Filter,
+    page: Option<Page>,
+    cursors: Vec<i64>,
+    search_seq: u64,
+    load_seq: u64,
+    searching: bool,
+    loading: bool,
+    search_due: Option<Instant>,
+    loaded: Option<Loaded>,
+    replay: Option<Replay>,
+    current: usize,
+    scrolled_node: Option<usize>,
+    piece_art: egui::TextureHandle,
+    bookcloth: egui::TextureHandle,
+    flipped: bool,
+    sounds_enabled: bool,
+    placement_sound: Option<Retained<NSSound>>,
+    capture_sound: Option<Retained<NSSound>>,
+    selected_square: Option<Square>,
+    promotion: Vec<Move>,
+    board_position: Option<(i64, usize)>,
+    engine_path: Option<PathBuf>,
+    analysis: Option<engine::Job>,
+    analysis_position: Option<(i64, usize)>,
+    evaluation: Option<engine::Evaluation>,
+    analysis_error: Option<String>,
+    continuous: bool,
+    review_job: Option<engine::Job>,
+    review_game: Option<i64>,
+    review_progress: (usize, usize),
+    review_error: Option<String>,
+    dirty: bool,
+    edited: Instant,
+    status: String,
+    error: Option<String>,
+    importing: bool,
+    exporting: bool,
+    progress: ImportStats,
+    cancel: Arc<AtomicBool>,
+}
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, db: rusqlite::Connection) -> Self {
+        let ctx = &cc.egui_ctx;
+        ctx.set_visuals(egui::Visuals::light());
+        let mut style = (*ctx.style()).clone();
+        style.visuals.panel_fill = Color32::from_rgb(247, 247, 243);
+        style.visuals.override_text_color = Some(INK);
+        style.visuals.selection.bg_fill = Color32::from_rgb(216, 233, 220);
+        style.visuals.selection.stroke.color = INK;
+        style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+        style.spacing.button_padding = Vec2::new(12.0, 7.0);
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        ctx.set_style(style);
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+            fonts
+                .font_data
+                .insert("symbols".into(), egui::FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("symbols".into());
+        }
+        ctx.set_fonts(fonts);
+        let piece_art = image::load_from_memory_with_format(
+            include_bytes!("../assets/stone-pieces.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("embedded chess piece atlas must be a valid PNG")
+        .into_rgba8();
+        debug_assert_eq!(piece_art.dimensions(), (768, 256));
+        let piece_art = ctx.load_texture(
+            "stone chess pieces",
+            egui::ColorImage::from_rgba_unmultiplied([768, 256], piece_art.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        let bookcloth = image::load_from_memory_with_format(
+            include_bytes!("../assets/bookcloth.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("embedded bookcloth texture must be a valid PNG")
+        .into_luma8();
+        let bookcloth = ctx.load_texture(
+            "board bookcloth",
+            egui::ColorImage::from_gray(
+                [bookcloth.width() as usize, bookcloth.height() as usize],
+                bookcloth.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR_MIRRORED_REPEAT
+                .with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
+        let (requests, events, receive) = library::worker(path.clone(), ctx.clone());
+        let mut app = Self {
+            db,
+            path,
+            requests,
+            events,
+            receive,
+            filter: Filter::default(),
+            page: None,
+            cursors: vec![i64::MAX],
+            search_seq: 0,
+            load_seq: 0,
+            searching: false,
+            loading: false,
+            search_due: None,
+            loaded: None,
+            replay: None,
+            current: 0,
+            scrolled_node: None,
+            piece_art,
+            bookcloth,
+            flipped: false,
+            sounds_enabled: !NSUserDefaults::standardUserDefaults()
+                .boolForKey(ns_string!("MuteBoardSounds")),
+            placement_sound: BoardSound::Placement.load(),
+            capture_sound: BoardSound::Capture.load(),
+            selected_square: None,
+            promotion: vec![],
+            board_position: None,
+            engine_path: engine::discover(),
+            analysis: None,
+            analysis_position: None,
+            evaluation: None,
+            analysis_error: None,
+            continuous: false,
+            review_job: None,
+            review_game: None,
+            review_progress: (0, 0),
+            review_error: None,
+            dirty: false,
+            edited: Instant::now(),
+            status: "Your chess, thoughtfully organised.".into(),
+            error: None,
+            importing: false,
+            exporting: false,
+            progress: ImportStats::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        app.refresh(false);
+        app
+    }
+    fn refresh(&mut self, reset: bool) {
+        if reset {
+            self.cursors = vec![i64::MAX];
+        }
+        self.search_seq += 1;
+        self.searching = true;
+        if self
+            .requests
+            .send(Request::Search(
+                self.search_seq,
+                self.filter.clone(),
+                *self.cursors.last().unwrap(),
+            ))
+            .is_err()
+        {
+            self.error = Some("The library worker stopped. Restart the app.".into());
+            self.searching = false;
+        }
+        self.search_due = None;
+    }
+    fn save(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        if let Some(loaded) = &self.loaded {
+            match library::save(&self.db, loaded) {
+                Ok(()) => {
+                    self.dirty = false;
+                    self.status = "Study work saved on this Mac".into();
+                }
+                Err(e) => {
+                    self.error = Some(format!(
+                        "Changes have not been saved: {e}. Your edits remain open; retry Save."
+                    ));
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    fn select(&mut self, id: i64) {
+        if !self.save() {
+            return;
+        }
+        if self.loaded.as_ref().is_some_and(|g| g.id == id) {
+            self.load_seq += 1;
+            self.loading = false;
+            return;
+        }
+        self.load_seq += 1;
+        self.loading = true;
+        if self
+            .requests
+            .send(Request::Load(self.load_seq, id))
+            .is_err()
+        {
+            self.loading = false;
+            self.error = Some("The library worker stopped.".into());
+        }
+    }
+    fn import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() || self.importing || !self.save() {
+            return;
+        }
+        self.importing = true;
+        self.progress = ImportStats::default();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.status = "Importing games… You can keep browsing.".into();
+        library::start_import(
+            self.path.clone(),
+            paths,
+            self.events.clone(),
+            ctx.clone(),
+            self.cancel.clone(),
+        );
+    }
+    fn choose_import(&mut self, ctx: &egui::Context) {
+        if self.importing {
+            return;
+        }
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Chess games", &["pgn"])
+            .set_title("Import PGN files")
+            .pick_files()
+        {
+            self.import_files(paths, ctx);
+        }
+    }
+    fn export(&mut self, current: bool) {
+        if self.exporting || !self.save() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PGN", &["pgn"])
+            .set_file_name(if current { "game.pgn" } else { "library.pgn" })
+            .save_file()
+        {
+            let db = std::fs::canonicalize(&self.path).unwrap_or(self.path.clone());
+            let target = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            if target == db
+                || target == format!("{}-wal", db.display())
+                || target == format!("{}-shm", db.display())
+            {
+                self.error = Some("Choose a PGN file, not the library database.".into());
+                return;
+            }
+            let (filter, id) = if current {
+                (Filter::default(), self.loaded.as_ref().map(|g| g.id))
+            } else {
+                (self.filter.clone(), None)
+            };
+            self.exporting = true;
+            if self
+                .requests
+                .send(Request::Export(filter, id, path))
+                .is_err()
+            {
+                self.exporting = false;
+                self.error = Some("The library worker stopped.".into());
+            }
+        }
+    }
+    fn events(&mut self) {
+        while let Ok(event) = self.receive.try_recv() {
+            match event {
+                Event::Page(seq, result) if seq == self.search_seq || seq == 0 => {
+                    self.searching = false;
+                    match result {
+                        Ok(page) => self.page = Some(page),
+                        Err(e) => self.error = Some(format!("Could not search library: {e}")),
+                    }
+                }
+                Event::Loaded(seq, result) if seq == self.load_seq => {
+                    self.loading = false;
+                    // Save edits made while the next game was loading before replacing the editor.
+                    if !self.save() {
+                        continue;
+                    }
+                    match result {
+                        Ok(loaded) => {
+                            match loaded.game.replay() {
+                                Ok(replay) => self.replay = Some(replay),
+                                Err(e) => {
+                                    self.replay = None;
+                                    self.error = Some(format!(
+                                        "Cannot display this game: {e}. It is still available for export."
+                                    ));
+                                }
+                            }
+                            self.loaded = Some(loaded);
+                            self.current = 0;
+                            self.scrolled_node = None;
+                            self.dirty = false;
+                        }
+                        Err(e) => self.error = Some(format!("Could not open game: {e}")),
+                    }
+                }
+                Event::Progress(stats) => self.progress = stats,
+                Event::Imported(result) => {
+                    self.importing = false;
+                    match result {
+                        Ok(stats) => {
+                            self.status = format!(
+                                "{} · {} added · {} duplicates skipped",
+                                if stats.cancelled {
+                                    "Import stopped"
+                                } else {
+                                    "Import complete"
+                                },
+                                stats.imported,
+                                stats.duplicates
+                            )
+                        }
+                        Err(e) => {
+                            self.error = Some(format!(
+                                "Import stopped: {e:#}. Completed batches are retained; importing again skips duplicates."
+                            ))
+                        }
+                    }
+                    self.refresh(true);
+                }
+                Event::Exported(result) => {
+                    self.exporting = false;
+                    match result {
+                        Ok(n) => self.status = format!("Exported {n} games with notes"),
+                        Err(e) => self.error = Some(format!("Export failed: {e}")),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("library")
+            .exact_width(302.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(236, 239, 233))
+                    .inner_margin(18),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("YOUR LIBRARY")
+                        .size(11.0)
+                        .strong()
+                        .color(GREEN),
+                );
+                ui.horizontal(|ui| {
+                    ui.heading("Games");
+                    if let Some(page) = &self.page {
+                        ui.label(RichText::new(format!("{}", page.all)).color(GREEN));
+                    }
+                });
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.filter.query)
+                        .hint_text("Search players, events, notes…")
+                        .desired_width(f32::INFINITY),
+                );
+                if response.changed() {
+                    self.search_due = Some(Instant::now());
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(!self.filter.starred, "All games")
+                        .clicked()
+                    {
+                        self.filter.starred = false;
+                        self.refresh(true);
+                    }
+                    if ui
+                        .selectable_label(self.filter.starred, "★ Favourites")
+                        .clicked()
+                    {
+                        self.filter.starred = true;
+                        self.refresh(true);
+                    }
+                });
+                let sources = self
+                    .page
+                    .as_ref()
+                    .map(|p| p.sources.clone())
+                    .unwrap_or_default();
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("sources")
+                    .width(ui.available_width())
+                    .selected_text(if self.filter.source.is_empty() {
+                        "All PGN files"
+                    } else {
+                        &self.filter.source
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.filter.source,
+                                String::new(),
+                                "All PGN files",
+                            )
+                            .changed();
+                        for (source, count) in sources {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.filter.source,
+                                    source.clone(),
+                                    format!("{source} · {count}"),
+                                )
+                                .changed();
+                        }
+                    });
+                if changed {
+                    self.refresh(true);
+                }
+                ui.separator();
+                let (rows, total, more) = self
+                    .page
+                    .as_ref()
+                    .map(|p| (p.rows.clone(), p.total, p.more))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.small(format!("{total} games"));
+                    if self.searching {
+                        ui.spinner();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("games")
+                    .max_height((ui.available_height() - 55.0).max(100.0))
+                    .show(ui, |ui| {
+                        if rows.is_empty() && !self.searching {
+                            ui.add_space(24.0);
+                            ui.label(if self.page.as_ref().is_some_and(|p| p.all > 0) {
+                                "No matching games.\nTry another search or file."
+                            } else {
+                                "A home for your chess.\nImport a PGN to get started."
+                            });
+                        }
+                        for row in rows {
+                            let selected = self.loaded.as_ref().is_some_and(|g| g.id == row.id);
+                            let name = |s: &str| {
+                                if s.is_empty() {
+                                    "?".to_owned()
+                                } else {
+                                    s.to_owned()
+                                }
+                            };
+                            let title = format!(
+                                "{}{}  —  {}",
+                                if row.starred { "★ " } else { "" },
+                                name(&row.white),
+                                name(&row.black)
+                            );
+                            let text = format!(
+                                "{title}\n{} · {}\n{}   {}",
+                                row.event, row.date, row.result, row.eco
+                            );
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 76.0],
+                                    egui::Button::new(RichText::new(text).size(13.0))
+                                        .wrap()
+                                        .selected(selected)
+                                        .frame(selected),
+                                )
+                                .clicked()
+                            {
+                                self.select(row.id);
+                            }
+                            ui.separator();
+                        }
+                    });
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.cursors.len() > 1 && !self.searching,
+                                egui::Button::new("← Back"),
+                            )
+                            .clicked()
+                        {
+                            self.cursors.pop();
+                            self.refresh(false);
+                        }
+                        ui.small(format!("Page {}", self.cursors.len()));
+                        if ui
+                            .add_enabled(more && !self.searching, egui::Button::new("Next →"))
+                            .clicked()
+                            && let Some(last) = self.page.as_ref().and_then(|p| p.rows.last())
+                        {
+                            self.cursors.push(last.id);
+                            self.refresh(false);
+                        }
+                    });
+                });
+            });
+    }
+    fn play(&mut self, movement: Move) {
+        if self.loading {
+            return;
+        }
+        if let (Some(loaded), Some(replay)) = (&mut self.loaded, &mut self.replay) {
+            let before = loaded.game.study.len();
+            match loaded.game.play(replay, self.current, movement) {
+                Ok(id) => {
+                    self.current = id;
+                    self.selected_square = None;
+                    self.promotion.clear();
+                    if loaded.game.study.len() != before {
+                        self.dirty = true;
+                        self.edited = Instant::now();
+                    }
+                }
+                Err(e) => self.error = Some(e.to_string()),
+            }
+        }
+    }
+
+    fn position_changed(&mut self) {
+        let key = self.loaded.as_ref().map(|g| (g.id, self.current));
+        let game = self.loaded.as_ref().map(|g| g.id);
+        if self.review_game != game {
+            self.review_job = None;
+            self.review_error = None;
+            self.review_progress = (0, 0);
+            self.review_game = game;
+        }
+        if key != self.board_position {
+            if self.sounds_enabled
+                && let (Some((game, current)), Some((previous_game, previous)), Some(replay)) =
+                    (key, self.board_position, &self.replay)
+                && game == previous_game
+                && let Some(cue) = move_sound(replay, previous, current)
+                && let Some(sound) = match cue {
+                    BoardSound::Placement => &self.placement_sound,
+                    BoardSound::Capture => &self.capture_sound,
+                }
+            {
+                if sound.isPlaying() {
+                    sound.stop();
+                }
+                sound.play();
+            }
+            self.selected_square = None;
+            self.promotion.clear();
+            self.board_position = key;
+        }
+        if key != self.analysis_position {
+            self.analysis = None;
+            self.evaluation = None;
+            self.analysis_error = None;
+            self.analysis_position = key;
+        }
+    }
+
+    fn engine_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.position_changed();
+        let mut finished = None;
+        if let Some(job) = &self.analysis {
+            while let Ok(event) = job.receive.try_recv() {
+                match event {
+                    engine::Event::Update(e) => self.evaluation = Some(e),
+                    engine::Event::Finished(result) => finished = Some(result),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(result) = finished {
+            self.analysis = None;
+            if let Err(e) = result {
+                self.analysis_error = Some(e.to_string());
+                self.continuous = false;
+            }
+        }
+        let mut reviewed = None;
+        if let Some(job) = &self.review_job {
+            while let Ok(event) = job.receive.try_recv() {
+                match event {
+                    engine::Event::Progress { done, total } => self.review_progress = (done, total),
+                    engine::Event::Reviewed(result) => reviewed = Some(result),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(result) = reviewed {
+            self.review_job = None;
+            match result {
+                Ok(report) => {
+                    if let Some(loaded) = &mut self.loaded {
+                        loaded.game.review = Some(report);
+                        self.dirty = true;
+                        self.edited = Instant::now();
+                        self.save();
+                    }
+                }
+                Err(e) => self.review_error = Some(e.to_string()),
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("Stockfish analysis").strong());
+        let position = self
+            .replay
+            .as_ref()
+            .and_then(|r| r.nodes[self.current].position.clone());
+        let terminal = position.as_ref().is_some_and(|p| p.outcome().is_known());
+        let available =
+            position.is_some() && !terminal && !self.loading && self.engine_path.is_some();
+        if ui
+            .add_enabled(
+                self.engine_path.is_some(),
+                egui::Checkbox::new(&mut self.continuous, "Continuous analysis"),
+            )
+            .changed()
+        {
+            self.analysis = None;
+            self.analysis_error = None;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    available && self.review_job.is_none(),
+                    egui::Button::new("Analyze once · 3 seconds"),
+                )
+                .clicked()
+            {
+                self.continuous = false;
+                drop(self.analysis.take());
+                self.evaluation = None;
+                self.analysis_error = None;
+                self.analysis = Some(engine::start(
+                    self.engine_path.clone().unwrap(),
+                    position.clone().unwrap(),
+                    false,
+                    ctx.clone(),
+                ));
+            }
+            if self.analysis.is_some() {
+                ui.spinner();
+                if ui.button("Stop").clicked() {
+                    self.continuous = false;
+                    self.analysis = None;
+                }
+            }
+        });
+        if self.continuous && available && self.analysis.is_none() && self.review_job.is_none() {
+            self.analysis = Some(engine::start(
+                self.engine_path.clone().unwrap(),
+                position.unwrap(),
+                true,
+                ctx.clone(),
+            ));
+        }
+        if self.continuous && self.review_job.is_some() {
+            ui.small("Continuous analysis pauses during game review.");
+        }
+        if terminal {
+            ui.small("Game over in this position.");
+        }
+        if let Some(e) = self.evaluation.clone() {
+            ui.label(RichText::new(format!("{}  ·  Depth {}", e.score, e.depth)).strong());
+            ui.small("Positive favours White; negative favours Black.");
+            if let Some(best) = e.best {
+                ui.label(format!(
+                    "Best move: {}",
+                    e.line.split_whitespace().next().unwrap_or("—")
+                ));
+                ui.label(&e.line);
+                if ui
+                    .add_enabled(!self.loading, egui::Button::new("Play best move"))
+                    .clicked()
+                {
+                    self.play(best);
+                }
+            }
+        }
+        if let Some(error) = &self.analysis_error {
+            ui.colored_label(Color32::DARK_RED, error);
+        }
+        self.review_panel(ui, ctx);
+        if self.engine_path.is_none() {
+            ui.label("Choose a local Stockfish executable to enable offline analysis.");
+            ui.hyperlink_to("Get Stockfish", "https://stockfishchess.org/download/");
+        }
+        ui.collapsing("Engine", |ui| {
+            if let Some(path) = &self.engine_path {
+                ui.small(path.display().to_string());
+            }
+            if ui.button("Choose Stockfish…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose the Stockfish executable")
+                    .pick_file()
+            {
+                self.analysis = None;
+                self.review_job = None;
+                self.evaluation = None;
+                self.analysis_error = None;
+                self.review_error = None;
+                self.engine_path = Some(path);
+            }
+            ui.small("Runs locally on one CPU thread. No game data is uploaded.");
+        });
+    }
+
+    fn review_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.separator();
+        ui.label(RichText::new("Whole-game review").strong());
+        if self.review_job.is_some() {
+            let (done, total) = self.review_progress;
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                    .text(format!("{done} / {total} positions")),
+            );
+            if ui.button("Stop game review").clicked() {
+                self.review_job = None;
+                self.review_error =
+                    Some("Review stopped. Any previous completed report is kept.".into());
+            }
+        } else if ui
+            .add_enabled(
+                self.loaded.is_some() && !self.loading && self.engine_path.is_some(),
+                egui::Button::new("Analyze whole game"),
+            )
+            .clicked()
+        {
+            self.analysis = None;
+            self.review_error = None;
+            match self.loaded.as_ref().unwrap().game.mainline_positions() {
+                Ok(positions) if positions.len() > 1 => {
+                    self.review_progress = (0, positions.len());
+                    self.review_job = Some(engine::start_review(
+                        self.engine_path.clone().unwrap(),
+                        positions,
+                        ctx.clone(),
+                    ));
+                }
+                Ok(_) => {
+                    self.review_error = Some("The original game has no moves to analyze.".into())
+                }
+                Err(e) => self.review_error = Some(e.to_string()),
+            }
+        }
+        ui.small("Original main line · 0.5 seconds per position");
+        if let Some(error) = &self.review_error {
+            ui.colored_label(Color32::DARK_RED, error);
+        }
+        if let Some(report) = self.loaded.as_ref().and_then(|g| g.game.review.as_ref()) {
+            if self.review_job.is_some() {
+                ui.small("Previous completed report");
+            }
+            egui::Grid::new("review-summary").striped(true).show(ui, |ui| {
+                ui.label(""); ui.strong("White"); ui.strong("Black"); ui.end_row();
+                ui.label("Approx. accuracy").on_hover_text("Average move accuracy estimated from loss of winning chances. Analysis time affects the result; this is not a Chess.com or Lichess game score.");
+                for white in [true, false] { ui.label(report.accuracy(white).map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into())); }
+                ui.end_row();
+                for quality in [engine::Quality::Best, engine::Quality::Good, engine::Quality::Inaccuracy, engine::Quality::Mistake, engine::Quality::Blunder] {
+                    ui.label(quality.label());
+                    for white in [true, false] { ui.label(report.count(white, quality).to_string()); }
+                    ui.end_row();
+                }
+            });
+            ui.small("Estimated from win-chance loss; deeper analysis may change the verdict.");
+            ui.collapsing("Moves & mistakes", |ui| {
+                if let Some(replay) = &self.replay {
+                    for movement in &report.moves {
+                        if movement.node >= replay.nodes.len() { continue; }
+                        let color = match movement.quality {
+                            engine::Quality::Blunder => Color32::DARK_RED,
+                            engine::Quality::Mistake => Color32::from_rgb(180, 90, 15),
+                            engine::Quality::Inaccuracy => Color32::from_rgb(145, 115, 20),
+                            _ => GREEN,
+                        };
+                        let text = format!("{} · {} · {}", replay.label(movement.node), movement.quality.label(), movement.score);
+                        if ui.selectable_label(self.current == movement.node, RichText::new(text).color(color))
+                            .on_hover_text(format!("Move accuracy {:.1}% · Win-chance loss {:.1} points\nSuggested line: {}", movement.accuracy, movement.loss, movement.best)).clicked() {
+                            self.current = movement.node;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    fn notebook(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("notebook")
+            .exact_width(310.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(16))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("study-desk")
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("STUDY DESK").size(11.0).strong().color(GREEN));
+                        ui.heading("Moves & notes");
+                        if self.loaded.is_none() {
+                            ui.label(
+                                "Select a game to explore its moves and write your own notes.",
+                            );
+                            return;
+                        }
+                        if let Some(replay) = &self.replay {
+                            let mut next = self.current;
+                            let line = replay.line(self.current);
+                            egui::ScrollArea::vertical()
+                                .id_salt("moves")
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    let start =
+                                        ui.selectable_label(self.current == 0, "Starting position");
+                                    if start.clicked() {
+                                        next = 0;
+                                    }
+                                    if self.current == 0 && self.scrolled_node != Some(0) {
+                                        start.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    ui.horizontal_wrapped(|ui| {
+                                        for &id in line.iter().skip(1) {
+                                            let marker = if self.loaded.as_ref().is_some_and(|l| {
+                                                l.notes.get(&id).is_some_and(|n| !n.is_empty())
+                                            }) {
+                                                " •"
+                                            } else {
+                                                ""
+                                            };
+                                            let response = ui.selectable_label(
+                                                self.current == id,
+                                                format!("{}{marker}", replay.label(id)),
+                                            );
+                                            if self.current == id && self.scrolled_node != Some(id)
+                                            {
+                                                response.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                            if response.clicked() {
+                                                next = id;
+                                            }
+                                        }
+                                    });
+                                });
+                            let node = &replay.nodes[self.current];
+                            if let Some(parent) = node.parent
+                                && replay.nodes[parent].children.len() > 1
+                            {
+                                ui.small("Alternatives at this move");
+                                ui.horizontal_wrapped(|ui| {
+                                    for &id in &replay.nodes[parent].children {
+                                        if ui
+                                            .add_enabled(
+                                                replay.nodes[id].position.is_some(),
+                                                egui::Button::new(&replay.nodes[id].san)
+                                                    .selected(id == self.current),
+                                            )
+                                            .clicked()
+                                        {
+                                            next = id;
+                                        }
+                                    }
+                                });
+                            }
+                            if node.children.len() > 1 {
+                                ui.small("Continue with");
+                                ui.horizontal_wrapped(|ui| {
+                                    for &id in &node.children {
+                                        if ui
+                                            .add_enabled(
+                                                replay.nodes[id].position.is_some(),
+                                                egui::Button::new(&replay.nodes[id].san),
+                                            )
+                                            .clicked()
+                                        {
+                                            next = id;
+                                        }
+                                    }
+                                });
+                            }
+                            if ui.small_button("Return to main line").clicked() {
+                                let main = replay.line(0);
+                                next = main[node.ply.min(main.len() - 1)];
+                            }
+                            self.scrolled_node = Some(self.current);
+                            self.current = next;
+                            if let Some(warning) = &replay.warning {
+                                ui.colored_label(Color32::from_rgb(163, 91, 36), warning);
+                            }
+                        }
+                        ui.separator();
+                        let title = self
+                            .replay
+                            .as_ref()
+                            .filter(|_| self.current > 0)
+                            .map(|r| format!("Notes after {}", r.label(self.current)))
+                            .unwrap_or_else(|| "Game notes".into());
+                        ui.label(RichText::new(title).strong());
+                        if let Some(loaded) = &mut self.loaded {
+                            let note = loaded.notes.entry(self.current).or_default();
+                            if ui
+                                .add(
+                                    egui::TextEdit::multiline(note)
+                                        .id_salt((loaded.id, self.current))
+                                        .hint_text("Plans, ideas, things to remember…")
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(4),
+                                )
+                                .changed()
+                            {
+                                self.dirty = true;
+                                self.edited = Instant::now();
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            ui.small(if self.dirty {
+                                "Unsaved changes"
+                            } else {
+                                "Saved locally"
+                            });
+                            if ui.button("Save").clicked() {
+                                self.save();
+                            }
+                        });
+                        if let Some(replay) = &self.replay {
+                            for annotation in &replay.nodes[self.current].annotations {
+                                if let crate::pgn::Token::Comment(text) = annotation {
+                                    ui.label(text);
+                                }
+                            }
+                        }
+                        self.engine_panel(ui, ctx);
+                        ui.collapsing("Game details & PGN", |ui| {
+                            if let Some(loaded) = &self.loaded {
+                                for (key, value) in &loaded.game.tags {
+                                    ui.label(format!("{key}: {value}"));
+                                }
+                                let mut pgn = loaded
+                                    .game
+                                    .export(&loaded.notes)
+                                    .unwrap_or_else(|e| format!("Cannot export this game: {e}"));
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut pgn)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            }
+                        });
+                    });
+            });
+    }
+    fn board(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(247,247,243)).inner_margin(24)).show(ctx,|ui| {
+            if self.loaded.is_none() {
+                ui.add_space(60.0);
+                ui.label(RichText::new("Every game has\nsomething to teach.").size(34.0).strong());
+                ui.add_space(16.0); ui.label("Bring your games together. Revisit the critical\npositions. Keep your thinking alongside the moves.");
+                ui.add_space(24.0);
+                if ui.add(egui::Button::new(RichText::new("Import PGN files").color(Color32::WHITE)).fill(GREEN)).clicked() { self.choose_import(ctx); }
+                if ui.button("Try a sample game").clicked() {
+                    let path = std::env::temp_dir().join("chesslib-sample.pgn");
+                    match std::fs::write(&path,include_str!("../fixtures/sample.pgn")) { Ok(()) => self.import_files(vec![path],ctx), Err(e) => self.error=Some(e.to_string()) }
+                }
+                ui.add_space(24.0); ui.small("Drag PGN files into this window · ⌘O to import\nYour library stays on this Mac.");
+                return;
+            }
+            let loaded = self.loaded.as_ref().unwrap();
+            let title = format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black"));
+            let subtitle = format!("{}  ·  {}  ·  {}",loaded.game.tag("Event"),loaded.game.tag("Date"),loaded.game.tag("Result"));
+            ui.label(RichText::new("GAME WORKSPACE").size(11.0).strong().color(GREEN));
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button(if self.loaded.as_ref().unwrap().starred { "★" } else { "☆" }).on_hover_text("Favourite this game").clicked() {
+                    let loaded = self.loaded.as_mut().unwrap(); loaded.starred = !loaded.starred; self.dirty=true; self.edited=Instant::now();
+                    if self.save() { self.refresh(false); }
+                }
+            });
+            ui.label(RichText::new(subtitle).size(13.0).color(Color32::GRAY));
+            ui.add_space(14.0);
+            if self.loading { ui.spinner(); }
+            let Some(replay) = &self.replay else { ui.label("Board unavailable for this game. You can still add game notes and export it."); return; };
+            let pos = replay.nodes[self.current].position.as_ref().unwrap();
+            let side = (ui.available_width()-64.0).min(ui.available_height()-125.0).max(240.0);
+            let cell = side/8.0;
+            let (rect,_) = ui.allocate_exact_size(Vec2::new(side+64.0,side+22.0),egui::Sense::hover());
+            let origin = rect.min+Vec2::new(64.0,0.0);
+            let saved_score = self.loaded.as_ref().and_then(|g| g.game.review.as_ref())
+                .and_then(|report| report.moves.iter().find(|m| m.node == self.current)).map(|m| m.score.as_str());
+            let score = self.evaluation.as_ref().map(|e| e.score.as_str()).or(saved_score);
+            let evaluation = evaluation_bar_value(pos, score);
+            let bar = egui::Rect::from_min_size(rect.min, Vec2::new(32.0, side));
+            let bar_label = evaluation.as_ref().map(|(_, label)| format!("Evaluation: {label}. Positive favours White; negative favours Black."))
+                .unwrap_or_else(|| "No evaluation for this position. Run analysis to see the advantage.".into());
+            let response = ui.interact(bar, ui.id().with("evaluation-bar"), egui::Sense::hover());
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &bar_label));
+            response.on_hover_text(bar_label);
+            let painter = ui.painter();
+            if let Some((white_share, label)) = evaluation {
+                painter.rect_filled(bar, 0.0, INK);
+                let white_height = bar.height() * white_share;
+                let white_top = if self.flipped { bar.top() } else { bar.bottom() - white_height };
+                painter.rect_filled(egui::Rect::from_min_size(egui::pos2(bar.left(), white_top), Vec2::new(bar.width(), white_height)), 0.0, Color32::from_rgb(250,250,247));
+                let white_advantage = white_share >= 0.5;
+                let at_top = white_advantage == self.flipped;
+                let label_pos = egui::pos2(bar.center().x, if at_top { bar.top()+12.0 } else { bar.bottom()-12.0 });
+                let font_size = if label.len() > 5 { 9.0 } else { 11.0 };
+                painter.text(label_pos, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(font_size), if white_advantage { INK } else { Color32::WHITE });
+                painter.line_segment([egui::pos2(bar.left(),bar.center().y), egui::pos2(bar.right(),bar.center().y)], egui::Stroke::new(1.0_f32,Color32::from_rgb(150,150,145)));
+            } else {
+                painter.rect_filled(bar, 0.0, Color32::from_rgb(220,223,217));
+                painter.text(bar.center(), egui::Align2::CENTER_CENTER, "—", egui::FontId::proportional(12.0), INK);
+            }
+            painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.0_f32,Color32::from_rgb(170,175,166)), egui::StrokeKind::Inside);
+            let legal = pos.legal_moves();
+            let mut clicked = None;
+            for row in 0..8 { for col in 0..8 {
+                let file = if self.flipped { 7-col } else { col };
+                let rank = if self.flipped { row } else { 7-row };
+                let square = Square::new((rank*8+file) as u32);
+                let min = origin+Vec2::new(col as f32*cell,row as f32*cell);
+                let square_rect = egui::Rect::from_min_size(min,Vec2::splat(cell));
+                let changed = replay.nodes[self.current].parent.and_then(|id| replay.nodes[id].position.as_ref())
+                    .is_some_and(|previous| previous.board().piece_at(square) != pos.board().piece_at(square));
+                let tint = match (self.selected_square == Some(square), changed, (row + col) % 2 == 0) {
+                    (true, _, _) => Color32::from_rgb(250, 213, 100),
+                    (_, true, true) => Color32::from_rgb(241, 239, 169),
+                    (_, true, false) => Color32::from_rgb(181, 193, 119),
+                    (_, false, true) => Color32::from_rgb(255, 250, 231),
+                    (_, false, false) => Color32::from_rgb(113, 156, 122),
+                };
+                let cloth_uv = egui::Rect::from_min_size(
+                    egui::pos2(col as f32 * 0.5, row as f32 * 0.5),
+                    Vec2::splat(0.5),
+                );
+                painter.image(self.bookcloth.id(), square_rect, cloth_uv, tint);
+                let destination = self.selected_square.is_some_and(|from| legal.iter().any(|m| m.from() == Some(from) && move_destination(*m) == square));
+                if destination { painter.circle_filled(square_rect.center(), cell * 0.12, Color32::from_black_alpha(75)); }
+                let piece = pos.board().piece_at(square);
+                let square_label = piece.map(|piece| format!("{square}: {:?} {:?}", piece.color, piece.role)).unwrap_or_else(|| format!("{square}: empty"));
+                let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click());
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !self.loading, &square_label));
+                if response.on_hover_text(square_label).clicked() { clicked = Some(square); }
+                if col==0 { painter.text(min-Vec2::new(12.0,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),Color32::GRAY); }
+                if row==7 { painter.text(min+Vec2::new(cell/2.0,cell+13.0),egui::Align2::CENTER_CENTER,((b'a'+file as u8) as char).to_string(),egui::FontId::proportional(11.0),Color32::GRAY); }
+                if let Some(piece) = piece {
+                    // Shorter pieces sit low in the atlas because the bases share a baseline.
+                    let (column, lift) = match piece.role {
+                        Role::King => (0, 0.0),
+                        Role::Queen => (1, 0.04),
+                        Role::Bishop => (2, 0.05),
+                        Role::Knight => (3, 0.05),
+                        Role::Rook => (4, 0.07),
+                        Role::Pawn => (5, 0.09),
+                    };
+                    let top = if piece.color == Color::White { 0.0 } else { 0.5 };
+                    let uv = egui::Rect::from_min_max(
+                        egui::pos2(column as f32 / 6.0, top),
+                        egui::pos2((column + 1) as f32 / 6.0, top + 0.5),
+                    );
+                    let piece_rect = square_rect.translate(Vec2::new(0.0, -cell * lift));
+                    painter.image(self.piece_art.id(), piece_rect, uv, Color32::WHITE);
+                }
+            }}
+            ui.add_space(8.0);
+            let line = replay.line(self.current);
+            let last = *line.last().unwrap();
+            let parent = replay.nodes[self.current].parent;
+            let next = replay.next(self.current);
+            let move_number = replay.nodes[self.current].ply;
+            let line_length = replay.nodes[last].ply;
+            let fen = Fen::from_position(pos,EnPassantMode::Legal).to_string();
+            let turn = if pos.turn()==Color::White { "White to move" } else { "Black to move" };
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.current>0,egui::Button::new("|←")).on_hover_text("Starting position · Home").clicked() { self.current=0; }
+                if ui.add_enabled(parent.is_some(),egui::Button::new("←")).on_hover_text("Previous move · Left arrow").clicked() { self.current=parent.unwrap_or(0); }
+                ui.label(format!("{move_number} / {line_length}"));
+                if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
+                if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
+                if ui.button("Flip").clicked() { self.flipped = !self.flipped; }
+            });
+            ui.horizontal(|ui| {
+                ui.small(turn);
+                if ui.small_button("Copy FEN").clicked() {
+                    ctx.copy_text(fen);
+                    self.status = "Position copied".into();
+                }
+                if ui.checkbox(&mut self.sounds_enabled, "Sounds").changed() {
+                    NSUserDefaults::standardUserDefaults()
+                        .setBool_forKey(!self.sounds_enabled, ns_string!("MuteBoardSounds"));
+                }
+            });
+            ui.small("Click a piece, then a highlighted square to explore a move.");
+            ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(Color32::GRAY));
+            if let Some(square) = clicked && !self.loading {
+                if let Some(from) = self.selected_square {
+                    let candidates: Vec<_> = legal.iter().copied().filter(|m| m.from() == Some(from) && move_destination(*m) == square).collect();
+                    if candidates.len() == 1 { self.play(candidates[0]); }
+                    else if candidates.len() > 1 { self.promotion = candidates; }
+                    else { self.selected_square = (square != from && pos.board().piece_at(square).is_some_and(|p| p.color == pos.turn())).then_some(square); }
+                } else {
+                    self.selected_square = pos.board().piece_at(square).filter(|p| p.color == pos.turn()).map(|_| square);
+                }
+            }
+        });
+    }
+}
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.events();
+        if self
+            .search_due
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(250))
+        {
+            self.refresh(true);
+        }
+        if self.dirty && self.edited.elapsed() > Duration::from_millis(700) {
+            self.save();
+            self.edited = Instant::now();
+        }
+        if self.dirty || self.search_due.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && (!self.save() || self.importing || self.exporting)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.importing {
+                self.cancel.store(true, Ordering::Relaxed);
+                self.status = "Finishing current import batch. Close again when complete.".into();
+            }
+            if self.exporting {
+                self.status = "Finishing export. Close again when complete.".into();
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+            self.choose_import(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.save();
+        }
+        if !ctx.wants_keyboard_input()
+            && let Some(replay) = &self.replay
+        {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                self.current = replay.next(self.current).unwrap_or(self.current);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                self.current = replay.nodes[self.current].parent.unwrap_or(0);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                self.current = 0;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                self.current = *replay.line(self.current).last().unwrap();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.selected_square = None;
+                self.promotion.clear();
+            }
+        }
+        self.position_changed();
+        let drops = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if !drops.is_empty() {
+            self.import_files(drops, ctx);
+        }
+        egui::TopBottomPanel::top("toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(INK)
+                    .inner_margin(egui::Margin::symmetric(22, 14)),
+            )
+            .show(ctx, |ui| {
+                ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("♞  CHESSLIB")
+                            .size(19.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.label(
+                        RichText::new(" /  A personal chess library")
+                            .size(12.0)
+                            .color(Color32::from_rgb(170, 187, 175)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.exporting,
+                                egui::Button::new("Export results")
+                                    .fill(Color32::from_rgb(57, 69, 64)),
+                            )
+                            .clicked()
+                        {
+                            self.export(false);
+                        }
+                        if ui
+                            .add_enabled(
+                                self.loaded.is_some() && !self.exporting,
+                                egui::Button::new("Export game")
+                                    .fill(Color32::from_rgb(57, 69, 64)),
+                            )
+                            .clicked()
+                        {
+                            self.export(true);
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.importing,
+                                egui::Button::new("+ Import PGN").fill(GREEN),
+                            )
+                            .clicked()
+                        {
+                            self.choose_import(ctx);
+                        }
+                    });
+                });
+            });
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(236, 239, 233))
+                    .inner_margin(10),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if self.importing {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Importing · {} added · {} duplicates",
+                            self.progress.imported, self.progress.duplicates
+                        ));
+                        if ui.button("Stop").clicked() {
+                            self.cancel.store(true, Ordering::Relaxed);
+                        }
+                    } else if self.exporting {
+                        ui.spinner();
+                        ui.label("Exporting PGN…");
+                    } else {
+                        ui.small(&self.status);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small("Saved on this Mac")
+                            .on_hover_text(self.path.display().to_string());
+                    });
+                });
+            });
+        self.sidebar(ctx);
+        self.notebook(ctx);
+        self.position_changed();
+        self.board(ctx);
+        self.position_changed();
+        if !self.promotion.is_empty() {
+            egui::Window::new("Promote pawn")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Choose a promotion piece");
+                    ui.horizontal(|ui| {
+                        for movement in self.promotion.clone() {
+                            let label = match movement.promotion() {
+                                Some(Role::Queen) => "Queen",
+                                Some(Role::Rook) => "Rook",
+                                Some(Role::Bishop) => "Bishop",
+                                Some(Role::Knight) => "Knight",
+                                _ => continue,
+                            };
+                            if ui.button(label).clicked() {
+                                self.play(movement);
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.promotion.clear();
+                        }
+                    });
+                });
+        }
+        if let Some(error) = self.error.clone() {
+            egui::Window::new("Needs attention")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(error);
+                    if ui.button("Dismiss").clicked() {
+                        self.error = None;
+                    }
+                });
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoardSound {
+    Placement,
+    Capture,
+}
+
+impl BoardSound {
+    fn load(self) -> Option<Retained<NSSound>> {
+        let (bytes, volume): (&[u8], _) = match self {
+            Self::Placement => (include_bytes!("../assets/piece-placement.mp3"), 1.0),
+            Self::Capture => (include_bytes!("../assets/piece-capture.mp3"), 0.5),
+        };
+        let sound = NSSound::initWithData(NSSound::alloc(), &NSData::with_bytes(bytes))?;
+        sound.setVolume(volume);
+        Some(sound)
+    }
+}
+
+fn move_sound(replay: &Replay, previous: usize, current: usize) -> Option<BoardSound> {
+    let node = &replay.nodes[current];
+    node.position.as_ref()?;
+    if node.parent != Some(previous) {
+        return None;
+    }
+    Some(if node.san.contains('x') {
+        BoardSound::Capture
+    } else {
+        BoardSound::Placement
+    })
+}
+
+fn evaluation_bar_value(position: &shakmaty::Chess, score: Option<&str>) -> Option<(f32, String)> {
+    if let Some(outcome) = position.outcome().known() {
+        return Some(match outcome.winner() {
+            Some(Color::White) => (1.0, "1-0".into()),
+            Some(Color::Black) => (0.0, "0-1".into()),
+            None => (0.5, "½".into()),
+        });
+    }
+    let score = score?;
+    if let Some(mate) = score.strip_prefix("Mate ") {
+        let moves: i32 = mate.parse().ok()?;
+        return Some(if moves > 0 {
+            (1.0, format!("M{moves}"))
+        } else {
+            (0.0, format!("-M{}", moves.unsigned_abs()))
+        });
+    }
+    let pawns: f64 = score.parse().ok()?;
+    if !pawns.is_finite() {
+        return None;
+    }
+    let share = (1.0 / (1.0 + (-0.368208 * pawns).exp())) as f32;
+    Some((
+        share,
+        if pawns.abs() < 0.05 {
+            "0.0".into()
+        } else {
+            format!("{pawns:+.1}")
+        },
+    ))
+}
+
+fn move_destination(movement: Move) -> Square {
+    match movement {
+        Move::Castle { king, rook } => Square::from_coords(
+            if rook.file() > king.file() {
+                shakmaty::File::G
+            } else {
+                shakmaty::File::C
+            },
+            king.rank(),
+        ),
+        _ => movement.to(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluation_bar_handles_unknown_scores_advantages_and_mates() {
+        let position = shakmaty::Chess::default();
+        assert!(evaluation_bar_value(&position, None).is_none());
+        assert!(evaluation_bar_value(&position, Some("NaN")).is_none());
+        assert!(evaluation_bar_value(&position, Some("Checkmate")).is_none());
+        assert_eq!(
+            evaluation_bar_value(&position, Some("0.00")),
+            Some((0.5, "0.0".into()))
+        );
+        let white = evaluation_bar_value(&position, Some("+3.00")).unwrap();
+        let black = evaluation_bar_value(&position, Some("-3.00")).unwrap();
+        assert!(white.0 > 0.5 && black.0 < 0.5);
+        assert!((white.0 + black.0 - 1.0).abs() < 1e-6);
+        assert_eq!(white.1, "+3.0");
+        assert_eq!(
+            evaluation_bar_value(&position, Some("Mate +3")),
+            Some((1.0, "M3".into()))
+        );
+        assert_eq!(
+            evaluation_bar_value(&position, Some("Mate -2")),
+            Some((0.0, "-M2".into()))
+        );
+        let game = pgn_reader::Reader::new("1. f3 e5 2. g4 Qh4# 0-1".as_bytes())
+            .read_game(&mut crate::pgn::Parser)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let positions = game.mainline_positions().unwrap();
+        assert_eq!(
+            evaluation_bar_value(&positions.last().unwrap().1, None),
+            Some((0.0, "0-1".into()))
+        );
+        let draw = "4k3/8/8/8/8/8/8/4K3 w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(shakmaty::CastlingMode::Standard)
+            .unwrap();
+        assert_eq!(evaluation_bar_value(&draw, None), Some((0.5, "½".into())));
+    }
+
+    #[test]
+    fn sounds_follow_single_forward_moves() {
+        let game = pgn_reader::Reader::new(include_str!("../fixtures/sample.pgn").as_bytes())
+            .read_game(&mut crate::pgn::Parser)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let replay = game.replay().unwrap();
+        let line = replay.line(0);
+        assert_eq!(
+            move_sound(&replay, line[0], line[1]),
+            Some(BoardSound::Placement)
+        );
+        assert_eq!(
+            move_sound(&replay, line[6], line[7]),
+            Some(BoardSound::Capture)
+        );
+        assert_eq!(
+            move_sound(&replay, line[20], line[21]),
+            Some(BoardSound::Capture)
+        );
+        assert_eq!(
+            move_sound(&replay, line[32], line[33]),
+            Some(BoardSound::Placement)
+        );
+        assert_eq!(move_sound(&replay, line[1], line[0]), None);
+        assert_eq!(move_sound(&replay, line[0], line[2]), None);
+    }
+
+    #[test]
+    fn bundled_board_recordings_decode() {
+        for cue in [BoardSound::Placement, BoardSound::Capture] {
+            let sound = cue.load().expect("embedded chess recording should decode");
+            let duration = sound.duration();
+            assert!(duration > 0.0 && duration < 0.4);
+        }
+    }
+
+    #[test]
+    fn castling_uses_the_kings_destination_square() {
+        assert_eq!(
+            move_destination(Move::Castle {
+                king: Square::E1,
+                rook: Square::H1
+            }),
+            Square::G1
+        );
+        assert_eq!(
+            move_destination(Move::Castle {
+                king: Square::E8,
+                rook: Square::A8
+            }),
+            Square::C8
+        );
+    }
+}
