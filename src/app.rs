@@ -634,9 +634,10 @@ impl App {
                     let mut chosen = None;
                     egui::ScrollArea::vertical().id_salt("events").show_rows(ui, 44.0, shown.len(), |ui, range| {
                         for event in &shown[range] {
-                            let dates = match (&event.first, &event.last) {
-                                (Some(first), Some(last)) if first != last => format!("{first} – {last}"),
-                                (Some(date), _) => date.clone(),
+                            let date = |d: &Option<String>| d.as_deref().and_then(pretty_date);
+                            let dates = match (date(&event.first), date(&event.last)) {
+                                (Some(first), Some(last)) if first != last => format!("📆 {first} – {last}"),
+                                (Some(date), _) => format!("📆 {date}"),
                                 _ => "Date unknown".into(),
                             };
                             let games = if event.games == 1 { "1 game".into() } else { format!("{} games", event.games) };
@@ -695,13 +696,19 @@ impl App {
                                 name(&row.white),
                                 name(&row.black)
                             );
-                            let text = format!(
-                                "{title}\n{} · {}\n{}   {}",
-                                row.event, row.date, row.result, row.eco
-                            );
+                            let mut text = egui::text::LayoutJob::default();
+                            let mut add = |s: &str, size: f32, color: Color32| {
+                                text.append(s, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), color));
+                            };
+                            add(&format!("{title}\n"), 13.0, INK);
+                            add(&format!("{}\n", event_name(&row.event)), 12.0, MUTED);
+                            if let Some(date) = pretty_date(&row.date) {
+                                add(&format!("📆 {date}     "), 13.0, GREEN);
+                            }
+                            add(&format!("{}   {}", row.result, row.eco), 13.0, INK);
                             let response = ui.add_sized(
                                 [ui.available_width(), 76.0],
-                                egui::Button::new(RichText::new(text).size(13.0))
+                                egui::Button::new(text)
                                     .wrap()
                                     .selected(selected)
                                     .frame(selected),
@@ -2548,4 +2555,28 @@ mod tests {
 /// An event's display name; PGN leaves unknown events blank or "?".
 fn event_name(name: &str) -> &str {
     if name.trim_matches([' ', '?']).is_empty() { "(No event)" } else { name }
+}
+
+/// A PGN date ("2026.11.07", "2026.11.??", "2026.??.??") as "7 Nov 2026", "Nov 2026" or "2026"; None when the year is unknown.
+fn pretty_date(date: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut parts = date.split('.').map(|p| p.parse::<usize>().ok());
+    let year = parts.next()??;
+    let month = parts.next().flatten().filter(|m| (1..=12).contains(m));
+    let day = parts.next().flatten().filter(|_| month.is_some());
+    Some(match (day, month) {
+        (Some(day), Some(month)) => format!("{day} {} {year}", MONTHS[month - 1]),
+        (_, Some(month)) => format!("{} {year}", MONTHS[month - 1]),
+        _ => year.to_string(),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn pretty_dates() {
+    assert_eq!(pretty_date("2026.11.07").as_deref(), Some("7 Nov 2026"));
+    assert_eq!(pretty_date("2026.11.??").as_deref(), Some("Nov 2026"));
+    assert_eq!(pretty_date("1858.??.??").as_deref(), Some("1858"));
+    assert_eq!(pretty_date("????.??.??"), None);
+    assert_eq!(pretty_date(""), None);
 }
