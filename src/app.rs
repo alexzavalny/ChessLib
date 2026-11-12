@@ -1140,7 +1140,7 @@ impl App {
             painter.rect_stroke(bar.expand(1.0), 4, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(140)), egui::StrokeKind::Outside);
             if let Some((white_share, label)) = evaluation {
                 painter.rect_filled(bar, 0.0, Color32::from_rgb(44, 44, 40));
-                let white_height = bar.height() * white_share;
+                let white_height = bar.height() * ctx.animate_value_with_time(ui.id().with("evaluation-bar-fill"), white_share, 0.4);
                 let white_top = if self.flipped { bar.top() } else { bar.bottom() - white_height };
                 painter.rect_filled(egui::Rect::from_min_size(egui::pos2(bar.left(), white_top), Vec2::new(bar.width(), white_height)), 0.0, IVORY);
                 let white_advantage = white_share >= 0.5;
