@@ -20,6 +20,8 @@ pub struct Evaluation {
     pub line: String,
     pub best: Option<Move>,
     pub white_chance: f64,
+    /// 1-based MultiPV rank; 1 is the engine's top line.
+    pub multipv: usize,
 }
 
 pub enum Event {
@@ -64,10 +66,17 @@ pub fn discover() -> Option<PathBuf> {
     })
 }
 
-pub fn start(path: PathBuf, position: Chess, continuous: bool, ctx: eframe::egui::Context) -> Job {
+pub fn start(
+    path: PathBuf,
+    position: Chess,
+    continuous: bool,
+    lines: usize,
+    ctx: eframe::egui::Context,
+) -> Job {
     spawn(ctx, move |cancel, emit| {
         let result = (|| {
             let mut engine = Engine::new(path, cancel)?;
+            writeln!(engine.input, "setoption name MultiPV value {lines}")?;
             engine.analyze(
                 &position,
                 &position_command(&position, &[]),
@@ -190,6 +199,7 @@ impl Engine {
                 line: String::new(),
                 best: None,
                 white_chance,
+                multipv: 1,
             });
         }
         writeln!(self.input, "{command}")?;
@@ -206,7 +216,9 @@ impl Engine {
             let line = read_line(&self.receive, deadline, cancel)?;
             if let Some(evaluation) = parse_info(&line, position) {
                 update(evaluation.clone());
-                latest = Some(evaluation);
+                if evaluation.multipv == 1 {
+                    latest = Some(evaluation);
+                }
             }
             if line.starts_with("bestmove ") {
                 return latest.context("Stockfish returned no usable evaluation");
@@ -437,6 +449,10 @@ fn parse_info(line: &str, position: &Chess) -> Option<Evaluation> {
         pos.play_unchecked(movement);
     }
     Some(Evaluation {
+        multipv: match at("multipv") {
+            Some(i) => words.get(i + 1)?.parse().ok()?,
+            None => 1,
+        },
         score,
         depth,
         line: moves.join(" "),
@@ -491,6 +507,9 @@ mod tests {
         );
         assert!(parse_info("info depth 1 score cp 0 pv e2e5", &pos).is_none());
         assert!(parse_info("info depth 1 score cp 0 lowerbound pv e2e4", &pos).is_none());
+        assert_eq!(e.multipv, 1);
+        let second = parse_info("info depth 12 multipv 2 score cp 20 pv d2d4", &pos).unwrap();
+        assert_eq!((second.multipv, second.line.as_str()), (2, "d4"));
     }
     #[test]
     fn engine_failure_timeout_and_cancellation_are_reported() {
@@ -547,6 +566,7 @@ mod tests {
             line: "e4".into(),
             best: Some(movement),
             white_chance: 50.0,
+            multipv: 1,
         };
         for (loss, quality) in [
             (0.0, Quality::Best),

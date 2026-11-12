@@ -60,7 +60,9 @@ pub struct App {
     engine_path: Option<PathBuf>,
     analysis: Option<engine::Job>,
     analysis_position: Option<(i64, usize)>,
-    evaluation: Option<engine::Evaluation>,
+    /// Engine lines for the current position, sorted by MultiPV rank.
+    lines: Vec<engine::Evaluation>,
+    engine_lines: usize,
     analysis_error: Option<String>,
     continuous: bool,
     review_job: Option<engine::Job>,
@@ -193,7 +195,11 @@ impl App {
             engine_path: engine::discover(),
             analysis: None,
             analysis_position: None,
-            evaluation: None,
+            lines: vec![],
+            engine_lines: match NSUserDefaults::standardUserDefaults().integerForKey(ns_string!("EngineLines")) {
+                n if n < 1 => 3,
+                n => (n as usize).min(5),
+            },
             analysis_error: None,
             continuous: false,
             review_job: None,
@@ -628,7 +634,7 @@ impl App {
         }
         if key != self.analysis_position {
             self.analysis = None;
-            self.evaluation = None;
+            self.lines.clear();
             self.analysis_error = None;
             self.analysis_position = key;
         }
@@ -640,7 +646,11 @@ impl App {
         if let Some(job) = &self.analysis {
             while let Ok(event) = job.receive.try_recv() {
                 match event {
-                    engine::Event::Update(e) => self.evaluation = Some(e),
+                    engine::Event::Update(e) => {
+                        self.lines.retain(|l| l.multipv != e.multipv);
+                        self.lines.push(e);
+                        self.lines.sort_by_key(|l| l.multipv);
+                    }
                     engine::Event::Finished(result) => finished = Some(result),
                     _ => {}
                 }
@@ -696,6 +706,16 @@ impl App {
             self.analysis = None;
             self.analysis_error = None;
         }
+        if ui
+            .add(egui::Slider::new(&mut self.engine_lines, 1..=5).text("Lines"))
+            .on_hover_text("How many candidate moves Stockfish calculates and shows as arrows")
+            .changed()
+        {
+            NSUserDefaults::standardUserDefaults()
+                .setInteger_forKey(self.engine_lines as _, ns_string!("EngineLines"));
+            self.analysis = None;
+            self.lines.clear();
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
@@ -706,12 +726,13 @@ impl App {
             {
                 self.continuous = false;
                 drop(self.analysis.take());
-                self.evaluation = None;
+                self.lines.clear();
                 self.analysis_error = None;
                 self.analysis = Some(engine::start(
                     self.engine_path.clone().unwrap(),
                     position.clone().unwrap(),
                     false,
+                    self.engine_lines,
                     ctx.clone(),
                 ));
             }
@@ -728,6 +749,7 @@ impl App {
                 self.engine_path.clone().unwrap(),
                 position.unwrap(),
                 true,
+                self.engine_lines,
                 ctx.clone(),
             ));
         }
@@ -737,15 +759,13 @@ impl App {
         if terminal {
             ui.small("Game over in this position.");
         }
-        if let Some(e) = self.evaluation.clone() {
+        if let Some(e) = self.lines.first().cloned() {
             ui.label(RichText::new(format!("{}  ·  Depth {}", e.score, e.depth)).strong());
             ui.small("Positive favours White; negative favours Black.");
+            for line in &self.lines {
+                ui.label(format!("{}. {}  {}", line.multipv, line.score, line.line));
+            }
             if let Some(best) = e.best {
-                ui.label(format!(
-                    "Best move: {}",
-                    e.line.split_whitespace().next().unwrap_or("—")
-                ));
-                ui.label(&e.line);
                 if ui
                     .add_enabled(!self.loading, egui::Button::new("Play best move"))
                     .clicked()
@@ -773,7 +793,7 @@ impl App {
             {
                 self.analysis = None;
                 self.review_job = None;
-                self.evaluation = None;
+                self.lines.clear();
                 self.analysis_error = None;
                 self.review_error = None;
                 self.engine_path = Some(path);
@@ -1107,7 +1127,7 @@ impl App {
             painter.hline(squares.x_range().expand(3.0), squares.bottom() + 3.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(30)));
             let saved_score = self.loaded.as_ref().and_then(|g| g.game.review.as_ref())
                 .and_then(|report| report.moves.iter().find(|m| m.node == self.current)).map(|m| m.score.as_str());
-            let score = self.evaluation.as_ref().map(|e| e.score.as_str()).or(saved_score);
+            let score = self.lines.first().map(|e| e.score.as_str()).or(saved_score);
             let evaluation = evaluation_bar_value(pos, score);
             let bar = egui::Rect::from_min_size(egui::pos2(rect.min.x + 4.0, origin.y), Vec2::new(28.0, side));
             let bar_label = evaluation.as_ref().map(|(_, label)| format!("Evaluation: {label}. Positive favours White; negative favours Black."))
@@ -1188,6 +1208,30 @@ impl App {
                     painter.image(self.piece_art.id(), piece_rect, uv, Color32::WHITE);
                 }
             }}
+            // Engine lines as arrows over the pieces, weakest first so the best sits on top.
+            // The legality check guards a stale evaluation.
+            let center = |s: Square| {
+                let (file, rank) = (s.file() as usize, s.rank() as usize);
+                let (col, row) = if self.flipped { (7 - file, rank) } else { (file, 7 - rank) };
+                origin + Vec2::new((col as f32 + 0.5) * cell, (row as f32 + 0.5) * cell)
+            };
+            for line in self.lines.iter().rev() {
+                let Some(best) = line.best.filter(|m| legal.contains(m)) else { continue };
+                let Some(from) = best.from() else { continue };
+                let (start, end) = (center(from), center(move_destination(best)));
+                let dir = (end - start).normalized();
+                let normal = dir.rot90();
+                let top = line.multipv == 1;
+                let (head, width) = if top { (cell * 0.4, cell * 0.16) } else { (cell * 0.32, cell * 0.11) };
+                let base = end - dir * head;
+                let color = if top { Color32::from_rgba_unmultiplied(40, 110, 200, 180) } else { Color32::from_rgba_unmultiplied(40, 110, 200, 100) };
+                painter.line_segment([start + dir * cell * 0.2, base], egui::Stroke::new(width, color));
+                painter.add(egui::Shape::convex_polygon(vec![end, base + normal * head * 0.6, base - normal * head * 0.6], color, egui::Stroke::NONE));
+                let galley = painter.layout_no_wrap(line.score.clone(), egui::FontId::proportional((cell * 0.2).clamp(10.0, 14.0)), Color32::WHITE);
+                let label = egui::Rect::from_center_size(start + (base - start) * 0.5, galley.size() + Vec2::new(8.0, 2.0));
+                painter.rect_filled(label, 4, Color32::from_rgba_unmultiplied(25, 70, 140, if top { 230 } else { 190 }));
+                painter.galley(label.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+            }
             ui.add_space(8.0);
             let line = replay.line(self.current);
             let last = *line.last().unwrap();
