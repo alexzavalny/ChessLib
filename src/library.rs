@@ -169,6 +169,16 @@ pub fn load(db: &Connection, id: i64) -> Result<Loaded> {
         starred,
     })
 }
+/// Games added after `after` with no White, no Black or no year ("?", "????.??.??" or blank).
+pub fn missing_details(db: &Connection, after: i64) -> Result<Vec<i64>> {
+    Ok(db
+        .prepare("SELECT id FROM games WHERE id > ?1 AND (trim(white, ' ?') = '' OR trim(black, ' ?') = '' OR date = '' OR date LIKE '?%') ORDER BY id")?
+        .query_map([after], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+pub fn last_id(db: &Connection) -> Result<i64> {
+    Ok(db.query_row("SELECT coalesce(max(id), 0) FROM games", [], |r| r.get(0))?)
+}
 fn search_text(game: &Game, notes: &Notes) -> String {
     let mut text = game
         .tags
@@ -191,13 +201,16 @@ fn search_text(game: &Game, notes: &Notes) -> String {
 pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
     anyhow::ensure!(
         db.execute(
-            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5 WHERE id=?4",
+            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8 WHERE id=?4",
             params![
                 serde_json::to_string(&loaded.notes)?,
                 loaded.starred,
                 search_text(&loaded.game, &loaded.notes),
                 loaded.id,
-                serde_json::to_string(&loaded.game)?
+                serde_json::to_string(&loaded.game)?,
+                loaded.game.tag("White"),
+                loaded.game.tag("Black"),
+                loaded.game.tag("Date")
             ]
         )? == 1,
         "Game no longer exists"
@@ -481,6 +494,17 @@ mod tests {
         };
         let page = search(&db, &filter, i64::MAX).unwrap();
         assert_eq!(page.total, 1);
+        let missing = missing_details(&db, 0).unwrap();
+        assert_eq!(missing.len(), 2, "neither fixture game has a date");
+        assert!(missing_details(&db, last_id(&db).unwrap()).unwrap().is_empty());
+        let mut dated = load(&db, missing[1]).unwrap();
+        dated.game.set_tag("Date", "2024.03.01".into());
+        dated.game.set_tag("White", "Magnus Carlsen".into());
+        save(&db, &dated).unwrap();
+        assert_eq!(missing_details(&db, 0).unwrap(), [missing[0]]);
+        assert_eq!(jump(&db, "Magnus").unwrap()[0].date, "2024.03.01");
+        dated.game.set_tag("White", "Carlsen".into());
+        save(&db, &dated).unwrap();
         let names = |q| jump(&db, q).unwrap().into_iter().map(|r| r.white).collect::<Vec<_>>();
         assert_eq!(names("arl nan"), ["Carlsen"]);
         assert_eq!(names("ISCH"), ["Tal"]);

@@ -45,6 +45,13 @@ impl Game {
             .unwrap_or("")
     }
 
+    pub fn set_tag(&mut self, key: &str, value: String) {
+        match self.tags.iter_mut().find(|(k, _)| k == key) {
+            Some((_, v)) => *v = value,
+            None => self.tags.push((key.into(), value)),
+        }
+    }
+
     pub fn initial(&self) -> Result<Chess> {
         anyhow::ensure!(
             matches!(self.tag("Variant"), "" | "Standard" | "Chess" | "Normal"),

@@ -52,6 +52,11 @@ pub struct App {
     play_setup: Option<PlaySettings>,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
+    /// The last game id before the running import, so new games can be checked afterwards.
+    import_floor: i64,
+    /// Imported games still missing players or date, and the one being filled in (White, Black, Date).
+    missing: Vec<i64>,
+    details: Option<(Loaded, [String; 3])>,
     db: rusqlite::Connection,
     path: PathBuf,
     requests: mpsc::Sender<Request>,
@@ -195,6 +200,9 @@ impl App {
             play: None,
             play_setup: None,
             jump: None,
+            import_floor: 0,
+            missing: Vec::new(),
+            details: None,
             db,
             path,
             requests,
@@ -323,6 +331,7 @@ impl App {
             return;
         }
         self.importing = true;
+        self.import_floor = library::last_id(&self.db).unwrap_or(i64::MAX);
         self.progress = ImportStats::default();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.status = "Importing games… You can keep browsing.".into();
@@ -437,6 +446,7 @@ impl App {
                             ))
                         }
                     }
+                    self.missing = library::missing_details(&self.db, self.import_floor).unwrap_or_default();
                     self.refresh(true);
                 }
                 Event::Exported(result) => {
@@ -1910,6 +1920,70 @@ impl eframe::App for App {
                 self.select(id);
             } else if close || modal.should_close() {
                 self.jump = None;
+            }
+        }
+        if self.details.is_none() && !self.missing.is_empty() {
+            match library::load(&self.db, self.missing.remove(0)) {
+                Ok(loaded) => {
+                    let known = |key: &str| {
+                        let v = loaded.game.tag(key);
+                        if v.is_empty() || v.starts_with('?') { String::new() } else { v.to_owned() }
+                    };
+                    let fields = [known("White"), known("Black"), known("Date")];
+                    self.details = Some((loaded, fields));
+                }
+                Err(e) => self.error = Some(format!("Could not open imported game: {e}")),
+            }
+        }
+        if let Some((loaded, fields)) = &mut self.details {
+            let (mut save, mut skip, mut skip_all) = (false, false, false);
+            let modal = egui::Modal::new(egui::Id::new("details")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Missing game details");
+                let game = &loaded.game;
+                ui.label(format!("{} · {}", game.tag("Event"), game.tag("Result")));
+                if !self.missing.is_empty() {
+                    ui.small(format!("{} more imported games need details after this one.", self.missing.len()));
+                }
+                ui.add_space(8.0);
+                egui::Grid::new("details_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    for (field, (label, hint)) in fields.iter_mut().zip([("White", "Player name"), ("Black", "Player name"), ("Date", "YYYY.MM.DD")]) {
+                        ui.label(label);
+                        ui.add(egui::TextEdit::singleline(field).hint_text(hint).desired_width(280.0));
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save = ui.button("Save").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    skip = ui.button("Skip").clicked();
+                    skip_all = !self.missing.is_empty() && ui.button("Skip all").clicked();
+                });
+            });
+            if save {
+                // Blank stays unknown, in PGN's own spelling.
+                for ((key, unknown), value) in [("White", "?"), ("Black", "?"), ("Date", "????.??.??")].into_iter().zip(fields.iter()) {
+                    let value = value.trim().replace(['-', '/'], ".");
+                    loaded.game.set_tag(key, if value.is_empty() { unknown.into() } else { value });
+                }
+                match library::save(&self.db, loaded) {
+                    Ok(()) => {
+                        // The editor may hold this game too; keep its next save from restoring the old tags.
+                        if let Some(open) = &mut self.loaded
+                            && open.id == loaded.id
+                        {
+                            open.game.tags = loaded.game.tags.clone();
+                        }
+                        self.refresh(false);
+                    }
+                    Err(e) => self.error = Some(format!("Could not save game details: {e}")),
+                }
+            }
+            if skip_all {
+                self.missing.clear();
+            }
+            if save || skip || skip_all || modal.should_close() {
+                self.details = None;
             }
         }
         if !self.promotion.is_empty() {
