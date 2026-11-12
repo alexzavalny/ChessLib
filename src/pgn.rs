@@ -92,6 +92,7 @@ impl Game {
         let mut replay = Replay {
             nodes: vec![root; main_count + 1],
             warning: None,
+            game_len: main_count + 1,
         };
         let mut current = 0;
         let mut main_id = 0;
@@ -297,6 +298,8 @@ pub struct Node {
 pub struct Replay {
     pub nodes: Vec<Node>,
     pub warning: Option<String>,
+    /// Nodes 0..game_len are the game's own main line; every other node is a variation or analysis.
+    game_len: usize,
 }
 
 impl Replay {
@@ -325,6 +328,12 @@ impl Replay {
             .filter(|&child| self.nodes[child].position.is_some())
     }
 
+    /// Whether `id` is the start position or a move actually played in the game.
+    pub fn in_game(&self, id: usize) -> bool {
+        id < self.game_len
+    }
+
+    /// The line through `id`; from a game move it runs to the game's end, never into analysis past it.
     pub fn line(&self, id: usize) -> Vec<usize> {
         let mut line = vec![id];
         let mut current = id;
@@ -334,7 +343,7 @@ impl Replay {
         }
         line.reverse();
         current = id;
-        while let Some(child) = self.next(current) {
+        while let Some(child) = self.next(current).filter(|&c| !self.in_game(id) || self.in_game(c)) {
             line.push(child);
             current = child;
         }
@@ -368,6 +377,8 @@ impl Replay {
         enum Action {
             Node(usize),
             Children(usize),
+            /// Repeats a game move's SAN to open a variation continuing past it.
+            Restate(usize),
             Open,
             Close,
         }
@@ -376,6 +387,7 @@ impl Replay {
             match action {
                 Action::Open => out.push_str("( "),
                 Action::Close => out.push_str(") "),
+                Action::Restate(id) => out.push_str(&format!("{} ", self.label(id).replace('…', "..."))),
                 Action::Node(id) => {
                     if id != 0 {
                         out.push_str(&self.label(id).replace('…', "..."));
@@ -394,7 +406,18 @@ impl Replay {
                 }
                 Action::Children(id) => {
                     let children = &self.nodes[id].children;
-                    if let Some(&first) = children.first() {
+                    // Analysis played past the game's last move: write "( 44. Kf2 Rb3 )", not as game moves.
+                    if self.in_game(id) && children.first().is_some_and(|&c| !self.in_game(c)) {
+                        for &child in children.iter().rev() {
+                            pending.push(Action::Close);
+                            pending.push(Action::Children(child));
+                            pending.push(Action::Node(child));
+                            if id != 0 {
+                                pending.push(Action::Restate(id));
+                            }
+                            pending.push(Action::Open);
+                        }
+                    } else if let Some(&first) = children.first() {
                         pending.push(Action::Children(first));
                         for &alternative in children[1..].iter().rev() {
                             pending.push(Action::Close);
@@ -578,6 +601,21 @@ mod tests {
                 && exported.contains("French")
                 && exported.contains("old main-line note")
         );
+    }
+
+    #[test]
+    fn analysis_past_the_last_move_stays_out_of_the_game() {
+        let mut game = parse("1. e4 e5 2. Nf3 *");
+        let mut replay = game.replay().unwrap();
+        let nc6 = play_san(&mut game, &mut replay, 3, "Nc6");
+        let bb5 = play_san(&mut game, &mut replay, nc6, "Bb5");
+        assert_eq!(replay.line(0), vec![0, 1, 2, 3]);
+        assert_eq!(replay.line(nc6), vec![0, 1, 2, 3, nc6, bb5]);
+        assert!(replay.in_game(3) && !replay.in_game(nc6));
+        let exported = game.export(&Notes::new()).unwrap();
+        assert!(exported.contains("2. Nf3 ( 2. Nf3 2... Nc6 3. Bb5 ) *"), "{exported}");
+        let again = parse(&exported).replay().unwrap();
+        assert_eq!(again.line(0).len(), 4, "re-imported game keeps its own length");
     }
 
     #[test]

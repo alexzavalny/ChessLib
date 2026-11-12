@@ -1357,7 +1357,11 @@ impl App {
                                                     l.notes.get(&id).is_some_and(|n| !n.is_empty())
                                                 });
                                                 let response = ui.add(
-                                                    egui::Button::selectable(self.current == id, replay.nodes[id].san.as_str())
+                                                    egui::Button::selectable(self.current == id, {
+                                                        // Variations and your own analysis read as asides, not moves from the game.
+                                                        let san = RichText::new(&replay.nodes[id].san);
+                                                        if replay.in_game(id) { san } else { san.italics().color(MUTED) }
+                                                    })
                                                         .min_size(cell)
                                                         .right_text(RichText::new(if noted { "•" } else { "" }).color(RIBBON)),
                                                 );
