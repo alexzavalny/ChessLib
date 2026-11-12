@@ -185,11 +185,11 @@ impl App {
         )
         .expect("embedded chess piece atlas must be a valid PNG")
         .into_rgba8();
-        debug_assert_eq!(piece_art.dimensions(), (768, 256));
+        debug_assert_eq!(piece_art.dimensions(), (1536, 512));
         let piece_art = ctx.load_texture(
             "stone chess pieces",
-            egui::ColorImage::from_rgba_unmultiplied([768, 256], piece_art.as_raw()),
-            egui::TextureOptions::LINEAR,
+            egui::ColorImage::from_rgba_unmultiplied([1536, 512], piece_art.as_raw()),
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
         );
         let bookcloth = image::load_from_memory_with_format(
             include_bytes!("../assets/bookcloth.png"),
