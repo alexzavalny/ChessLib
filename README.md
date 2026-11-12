@@ -17,7 +17,7 @@ The toolchain file selects native Apple Silicon Rust. On Intel, use an installed
 
 ## Use it
 
-- **Import PGN** or **⌘O** opens one or more files; dropping PGNs into the window also imports them, and **⌘V** outside a text field imports PGN text from the clipboard (listed under the source `chesslib-paste.pgn`). The sample button adds Morphy's Opera Game.
+- **Import PGN** or **⌘O** opens one or more files; dropping PGNs into the window also imports them, and **⌘V** outside a text field imports PGN text from the clipboard (listed under the source `chesslib-paste.pgn`). The sample button adds Morphy's Opera Game. After an import, each new game missing players, event or date asks for them; right-click any game and choose **Edit…** to change those fields later.
 - Search players, event names, dates, ECO codes, imported comments, and your notes. Search is case-insensitive, matches word prefixes, and requires all entered words. It is not an arbitrary substring search.
 - Narrow the library by source PGN filename or favourites. Results are paged, newest imports first.
 - Select a game, click a move, or use **← / →**, **↑ / ↓** or **Home / End**. Navigation follows the current line. Flip the board (**F**) or copy the current FEN. **L** toggles continuous analysis. Drag the rule under the move list to resize it.
@@ -58,7 +58,7 @@ For a complete backup, quit the app and copy the database. While the app is runn
 
 - Standard chess and legal FEN starting positions. Unsupported variants remain stored and exportable, with a display error. An illegal imported move disables that continuation with an explanation; other legal branches remain playable and the original tokens survive export.
 - Variations can be added and explored, with notes on each position. Deleting/reordering lines, replacing the original main line, and editing imported annotations are not included.
-- No opening tree, online sync, position search, collection deletion, or game metadata editor. Position analysis supports one-shot and continuous modes. Full-game review covers the original main line; it does not classify study variations.
+- No opening tree, online sync, position search, or collection deletion. The game editor covers White, Black, Event and Date only. Position analysis supports one-shot and continuous modes. Full-game review covers the original main line; it does not classify study variations.
 - Notes are separate from original annotations. On export, braces in comments are replaced with parentheses because PGN brace comments cannot nest.
 - UTF-8 PGNs are supported; invalid byte sequences are replaced by the Unicode replacement character. Very long comments may be normalized into multiple comments. A single game is capped at 16 MiB of parsed content to bound accidental memory growth. Malformed PGNs should be checked against their originals; the PGN reader is permissive.
 - The app is locally ad-hoc signed, not Developer ID signed or notarized for distribution. Built with eframe/egui, pgn-reader, shakmaty, and bundled SQLite. The project is GPL-3.0-or-later, consistent with the chess library dependency.

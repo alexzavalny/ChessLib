@@ -54,9 +54,9 @@ pub struct App {
     jump: Option<(String, Vec<library::Row>, usize)>,
     /// The last game id before the running import, so new games can be checked afterwards.
     import_floor: i64,
-    /// Imported games still missing players or date, and the one being filled in (White, Black, Date).
+    /// Imported games still missing details, and the one being filled in (White, Black, Event, Date; true when opened by Edit…).
     missing: Vec<i64>,
-    details: Option<(Loaded, [String; 3])>,
+    details: Option<(Loaded, [String; 4], bool)>,
     db: rusqlite::Connection,
     path: PathBuf,
     requests: mpsc::Sender<Request>,
@@ -324,6 +324,23 @@ impl App {
         {
             self.loading = false;
             self.error = Some("The library worker stopped.".into());
+        }
+    }
+    fn edit_details(&mut self, id: i64, editing: bool) {
+        // Flush pending notes first: the dialog saves its own copy of the game from the database.
+        if editing && !self.save() {
+            return;
+        }
+        match library::load(&self.db, id) {
+            Ok(loaded) => {
+                let known = |key: &str| {
+                    let v = loaded.game.tag(key);
+                    if v.is_empty() || v.starts_with('?') { String::new() } else { v.to_owned() }
+                };
+                let fields = [known("White"), known("Black"), known("Event"), known("Date")];
+                self.details = Some((loaded, fields, editing));
+            }
+            Err(e) => self.error = Some(format!("Could not open game: {e}")),
         }
     }
     fn import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
@@ -604,6 +621,12 @@ impl App {
                             if response.clicked() {
                                 self.select(row.id);
                             }
+                            response.context_menu(|ui| {
+                                if ui.button("Edit…").clicked() {
+                                    self.edit_details(row.id, true);
+                                    ui.close();
+                                }
+                            });
                             ui.separator();
                         }
                     });
@@ -1934,31 +1957,22 @@ impl eframe::App for App {
             }
         }
         if self.details.is_none() && !self.missing.is_empty() {
-            match library::load(&self.db, self.missing.remove(0)) {
-                Ok(loaded) => {
-                    let known = |key: &str| {
-                        let v = loaded.game.tag(key);
-                        if v.is_empty() || v.starts_with('?') { String::new() } else { v.to_owned() }
-                    };
-                    let fields = [known("White"), known("Black"), known("Date")];
-                    self.details = Some((loaded, fields));
-                }
-                Err(e) => self.error = Some(format!("Could not open imported game: {e}")),
-            }
+            let id = self.missing.remove(0);
+            self.edit_details(id, false);
         }
-        if let Some((loaded, fields)) = &mut self.details {
+        if let Some((loaded, fields, editing)) = &mut self.details {
+            let editing = *editing;
             let (mut save, mut skip, mut skip_all) = (false, false, false);
             let modal = egui::Modal::new(egui::Id::new("details")).show(ctx, |ui| {
                 ui.set_width(420.0);
-                ui.heading("Missing game details");
-                let game = &loaded.game;
-                ui.label(format!("{} · {}", game.tag("Event"), game.tag("Result")));
-                if !self.missing.is_empty() {
+                ui.heading(if editing { "Edit game" } else { "Missing game details" });
+                ui.label(loaded.game.tag("Result"));
+                if !editing && !self.missing.is_empty() {
                     ui.small(format!("{} more imported games need details after this one.", self.missing.len()));
                 }
                 ui.add_space(8.0);
                 egui::Grid::new("details_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    for (field, (label, hint)) in fields.iter_mut().zip([("White", "Player name"), ("Black", "Player name"), ("Date", "YYYY.MM.DD")]) {
+                    for (field, (label, hint)) in fields.iter_mut().zip([("White", "Player name"), ("Black", "Player name"), ("Event", "Tournament or match"), ("Date", "YYYY.MM.DD")]) {
                         ui.label(label);
                         ui.add(egui::TextEdit::singleline(field).hint_text(hint).desired_width(280.0));
                         ui.end_row();
@@ -1967,14 +1981,15 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     save = ui.button("Save").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    skip = ui.button("Skip").clicked();
-                    skip_all = !self.missing.is_empty() && ui.button("Skip all").clicked();
+                    skip = ui.button(if editing { "Cancel" } else { "Skip" }).clicked();
+                    skip_all = !editing && !self.missing.is_empty() && ui.button("Skip all").clicked();
                 });
             });
             if save {
                 // Blank stays unknown, in PGN's own spelling.
-                for ((key, unknown), value) in [("White", "?"), ("Black", "?"), ("Date", "????.??.??")].into_iter().zip(fields.iter()) {
-                    let value = value.trim().replace(['-', '/'], ".");
+                for ((key, unknown), value) in [("White", "?"), ("Black", "?"), ("Event", "?"), ("Date", "????.??.??")].into_iter().zip(fields.iter()) {
+                    let value = value.trim();
+                    let value = if key == "Date" { value.replace(['-', '/'], ".") } else { value.to_owned() };
                     loaded.game.set_tag(key, if value.is_empty() { unknown.into() } else { value });
                 }
                 match library::save(&self.db, loaded) {
