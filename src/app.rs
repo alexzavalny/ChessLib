@@ -639,6 +639,10 @@ impl App {
                                     self.edit_details(row.id, true);
                                     ui.close();
                                 }
+                                if ui.button("Train on this game").clicked() {
+                                    self.start_training(Some(row.id));
+                                    ui.close();
+                                }
                             });
                             ui.separator();
                         }
@@ -723,8 +727,10 @@ impl App {
         self.current = 0;
     }
 
-    fn start_training(&mut self) {
-        let puzzles = match library::mistakes(&self.db, &self.train_player) {
+    /// Puzzles from one game (both sides), or from every reviewed game for the remembered player.
+    fn start_training(&mut self, game: Option<i64>) {
+        let player = if game.is_some() { "" } else { self.train_player.as_str() };
+        let puzzles = match library::mistakes(&self.db, game, player) {
             Ok(puzzles) => puzzles,
             Err(e) => {
                 self.error = Some(format!("Could not collect mistakes: {e}"));
@@ -732,7 +738,11 @@ impl App {
             }
         };
         if puzzles.is_empty() {
-            self.error = Some("No blunders found. Run Analyze whole game on some games first, or check the player name.".into());
+            self.error = Some(if game.is_some() {
+                "This game has no blunders, or it hasn't been reviewed yet. Open it and run Analyze whole game first.".into()
+            } else {
+                "No blunders found. Run Analyze whole game on some games first, or check the player name.".into()
+            });
             return;
         }
         if !self.save() {
@@ -2042,7 +2052,7 @@ impl eframe::App for App {
                 });
             if start {
                 self.train_setup = false;
-                self.start_training();
+                self.start_training(None);
             } else if cancel {
                 self.train_setup = false;
             }

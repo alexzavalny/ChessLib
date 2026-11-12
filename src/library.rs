@@ -186,14 +186,14 @@ pub struct Puzzle {
     pub best: String,
 }
 /// Blunders (a loss of 20+ win-chance points) from reviewed games, newest games first; milder
-/// mistakes are too subtle to make clear puzzles. A non-blank `player` keeps only
+/// mistakes are too subtle to make clear puzzles. `game` limits it to one game. A non-blank `player` keeps only
 /// moves by a side whose name contains every word of it (case-insensitive).
-pub fn mistakes(db: &Connection, player: &str) -> Result<Vec<Puzzle>> {
+pub fn mistakes(db: &Connection, game: Option<i64>, player: &str) -> Result<Vec<Puzzle>> {
     let words: Vec<String> = player.split_whitespace().map(str::to_lowercase).collect();
     let mut puzzles = Vec::new();
     // shortcut: parses every reviewed game on the UI thread; move to the worker if reviews number in the thousands.
-    let mut stmt = db.prepare("SELECT body FROM games WHERE instr(body, '\"review\":{') > 0 ORDER BY id DESC")?;
-    for body in stmt.query_map([], |r| r.get::<_, String>(0))? {
+    let mut stmt = db.prepare("SELECT body FROM games WHERE instr(body, '\"review\":{') > 0 AND (?1 IS NULL OR id = ?1) ORDER BY id DESC")?;
+    for body in stmt.query_map([game], |r| r.get::<_, String>(0))? {
         let body = body?;
         let game: Game = serde_json::from_str(&body)?;
         let (Some(review), Ok(positions), Ok(replay)) = (&game.review, game.mainline_positions(), game.replay()) else { continue };
@@ -660,11 +660,13 @@ mod tests {
             Some(98.0)
         );
         assert_eq!(reopened.game.replay().unwrap().nodes[branch].san, "Nc3");
-        let puzzles = mistakes(&db, "").unwrap();
+        let puzzles = mistakes(&db, None, "").unwrap();
         assert_eq!(puzzles.len(), 1, "only the blunder becomes a puzzle");
         assert_eq!((puzzles[0].played.as_str(), puzzles[0].best.as_str()), ("e5", "c5 Nf3"));
         assert_eq!(shakmaty::Position::turn(&puzzles[0].position), shakmaty::Color::Black);
-        assert!(mistakes(&db, "Tal").unwrap().is_empty());
+        assert!(mistakes(&db, None, "Tal").unwrap().is_empty());
+        assert_eq!(mistakes(&db, Some(1), "").unwrap().len(), 1);
+        assert!(mistakes(&db, Some(2), "").unwrap().is_empty());
         assert_eq!(
             search(
                 &db,
