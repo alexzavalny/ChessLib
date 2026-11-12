@@ -176,7 +176,7 @@ pub fn missing_details(db: &Connection, after: i64) -> Result<Vec<i64>> {
         .query_map([after], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?)
 }
-/// A position before a reviewed mistake or blunder, to replay as a puzzle.
+/// A position before a reviewed blunder, to replay as a puzzle.
 pub struct Puzzle {
     pub white: String,
     pub black: String,
@@ -184,12 +184,11 @@ pub struct Puzzle {
     pub position: shakmaty::Chess,
     pub played: String,
     pub best: String,
-    pub quality: crate::engine::Quality,
 }
-/// Mistakes and blunders from reviewed games, newest games first. A non-blank `player` keeps only
+/// Blunders (a loss of 20+ win-chance points) from reviewed games, newest games first; milder
+/// mistakes are too subtle to make clear puzzles. A non-blank `player` keeps only
 /// moves by a side whose name contains every word of it (case-insensitive).
 pub fn mistakes(db: &Connection, player: &str) -> Result<Vec<Puzzle>> {
-    use crate::engine::Quality;
     let words: Vec<String> = player.split_whitespace().map(str::to_lowercase).collect();
     let mut puzzles = Vec::new();
     // shortcut: parses every reviewed game on the UI thread; move to the worker if reviews number in the thousands.
@@ -198,7 +197,7 @@ pub fn mistakes(db: &Connection, player: &str) -> Result<Vec<Puzzle>> {
         let body = body?;
         let game: Game = serde_json::from_str(&body)?;
         let (Some(review), Ok(positions), Ok(replay)) = (&game.review, game.mainline_positions(), game.replay()) else { continue };
-        for m in review.moves.iter().filter(|m| matches!(m.quality, Quality::Mistake | Quality::Blunder)) {
+        for m in review.moves.iter().filter(|m| m.quality == crate::engine::Quality::Blunder) {
             let name = game.tag(if m.white { "White" } else { "Black" }).to_lowercase();
             let Some(i) = positions.iter().position(|(node, _)| *node == m.node) else { continue };
             if i == 0 || !words.iter().all(|w| name.contains(w.as_str())) {
@@ -211,7 +210,6 @@ pub fn mistakes(db: &Connection, player: &str) -> Result<Vec<Puzzle>> {
                 position: positions[i - 1].1.clone(),
                 played: replay.nodes[m.node].san.clone(),
                 best: m.best.clone(),
-                quality: m.quality,
             });
         }
     }

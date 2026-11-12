@@ -732,7 +732,7 @@ impl App {
             }
         };
         if puzzles.is_empty() {
-            self.error = Some("No mistakes or blunders found. Run Analyze whole game on some games first, or check the player name.".into());
+            self.error = Some("No blunders found. Run Analyze whole game on some games first, or check the player name.".into());
             return;
         }
         if !self.save() {
@@ -773,7 +773,7 @@ impl App {
         section(ui, "Train on mistakes", &format!("Puzzle {} of {total}", index + 1));
         ui.label(format!("{} — {} · {}", puzzle.white, puzzle.black, puzzle.date));
         let side = if puzzle.position.turn() == Color::White { "White" } else { "Black" };
-        ui.label(format!("{side} to move. The game went {} here, a {}. Find a better move.", puzzle.played, puzzle.quality.label().to_lowercase()));
+        ui.label(format!("{side} to move. The game went {} here, a blunder. Find a better move.", puzzle.played));
         ui.add_space(6.0);
         let parse = |san: &str| san.parse::<shakmaty::san::SanPlus>().ok()?.san.to_move(&puzzle.position).ok();
         let best = puzzle.best.split_whitespace().next().and_then(parse);
@@ -793,10 +793,11 @@ impl App {
         }
         let mut revealed = train.revealed;
         if revealed {
-            ui.label(format!("Engine line: {}", puzzle.best));
+            let line: Vec<_> = puzzle.best.split_whitespace().take(4).collect();
+            ui.label(format!("Engine line: {} …", line.join(" ")));
         }
         let (mut retry, mut next) = (false, false);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             retry = ui.add_enabled(self.current != 0, egui::Button::new("Try again")).clicked();
             revealed |= ui.add_enabled(!revealed, egui::Button::new("Show answer")).clicked();
             next = ui.button(if index + 1 < total { "Next puzzle" } else { "Finish" }).clicked();
@@ -2025,7 +2026,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("Puzzles from mistakes and blunders in games you have reviewed.");
+                    ui.label("Puzzles from blunders in every game you have reviewed.");
                     ui.horizontal(|ui| {
                         ui.label("Player");
                         let field = ui.add(egui::TextEdit::singleline(&mut self.train_player).hint_text("Both sides").desired_width(220.0));
