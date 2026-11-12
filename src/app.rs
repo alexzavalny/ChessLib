@@ -1420,7 +1420,6 @@ impl App {
             let move_number = replay.nodes[self.current].ply;
             let line_length = replay.nodes[last].ply;
             let fen = Fen::from_position(pos,EnPassantMode::Legal).to_string();
-            let turn = if pos.turn()==Color::White { "White to move" } else { "Black to move" };
             ui.horizontal(|ui| {
                 if ui.add_enabled(self.current>0,egui::Button::new("|←")).on_hover_text("Starting position · Home").clicked() { self.current=0; }
                 if ui.add_enabled(parent.is_some(),egui::Button::new("←")).on_hover_text("Previous move · Left arrow").clicked() { self.current=parent.unwrap_or(0); }
@@ -1428,20 +1427,51 @@ impl App {
                 if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
                 if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
                 if ui.button("Flip").on_hover_text("Flip the board (F)").clicked() { self.flipped = !self.flipped; }
-            });
-            ui.horizontal(|ui| {
-                ui.small(turn);
-                if ui.small_button("Copy FEN").clicked() {
-                    ctx.copy_text(fen);
+                if ui.button("Copy FEN").on_hover_text(&fen).clicked() {
+                    ctx.copy_text(fen.clone());
                     self.status = "Position copied".into();
                 }
-                if ui.checkbox(&mut self.sounds_enabled, "Sounds").changed() {
-                    NSUserDefaults::standardUserDefaults()
-                        .setBool_forKey(!self.sounds_enabled, ns_string!("MuteBoardSounds"));
-                }
             });
-            ui.small("Click or drag a piece to a highlighted square to explore a move.");
-            ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(MUTED));
+            // Evaluation graph from the game review: ivory rises with White's advantage, like the bar beside the board.
+            let points: Vec<(usize, f32, String, engine::Quality)> = self.loaded.as_ref().and_then(|l| l.game.review.as_ref())
+                .map(|review| review.moves.iter().filter_map(|m| {
+                    let (share, label) = evaluation_bar_value(replay.nodes.get(m.node)?.position.as_ref()?, Some(&m.score))?;
+                    Some((m.node, share, label, m.quality))
+                }).collect())
+                .unwrap_or_default();
+            if points.is_empty() {
+                ui.small("Run a game review to see the evaluation graph.");
+            } else {
+                ui.add_space(6.0);
+                let (graph, response) = ui.allocate_exact_size(Vec2::new(cover.width(), 80.0), egui::Sense::click());
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Evaluation graph. Click to jump to a move."));
+                let painter = ui.painter_at(graph);
+                let span = (points.len() as f32 - 1.0).max(1.0);
+                let at = |i: usize| egui::pos2(graph.left() + graph.width() * i as f32 / span, graph.bottom() - graph.height() * points[i].1);
+                painter.rect_filled(graph, 0, Color32::from_rgb(44, 44, 40));
+                for i in 1..points.len() {
+                    let (a, b) = (at(i - 1), at(i));
+                    painter.add(egui::Shape::convex_polygon(vec![egui::pos2(a.x, graph.bottom()), a, b, egui::pos2(b.x, graph.bottom())], IVORY, egui::Stroke::NONE));
+                }
+                painter.hline(graph.x_range(), graph.center().y, egui::Stroke::new(1.0_f32, Color32::from_rgb(150, 150, 145)));
+                painter.add(egui::Shape::line((0..points.len()).map(at).collect(), egui::Stroke::new(1.5_f32, RIBBON)));
+                for (i, point) in points.iter().enumerate() {
+                    if matches!(point.3, engine::Quality::Inaccuracy | engine::Quality::Mistake | engine::Quality::Blunder) {
+                        painter.circle(at(i), 3.0, quality_style(point.3).0, egui::Stroke::new(1.0_f32, IVORY));
+                    }
+                }
+                if let Some(i) = points.iter().position(|p| p.0 == self.current) {
+                    painter.vline(at(i).x, graph.y_range(), egui::Stroke::new(1.0_f32, RIBBON));
+                }
+                let hovered = response.hover_pos().map(|p| (((p.x - graph.left()) / graph.width() * span).round().max(0.0) as usize).min(points.len() - 1));
+                if let Some(i) = hovered {
+                    painter.circle_filled(at(i), 4.5, RIBBON);
+                    let (id, _, label, quality) = &points[i];
+                    let text = format!("{} [{}]\nAdvantage: {label}", replay.label(*id), quality.label());
+                    if response.on_hover_text_at_pointer(text).clicked() { self.current = *id; }
+                }
+                ui.painter().rect_stroke(graph, 0, egui::Stroke::new(1.0_f32, BEVEL), egui::StrokeKind::Outside);
+            }
             });
             if let Some(square) = clicked && !self.loading {
                 if let Some(from) = self.selected_square {
@@ -1587,6 +1617,11 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.choose_import(ctx);
+                        }
+                        ui.add_space(8.0);
+                        if ui.checkbox(&mut self.sounds_enabled, RichText::new("Sounds").color(IVORY)).changed() {
+                            NSUserDefaults::standardUserDefaults()
+                                .setBool_forKey(!self.sounds_enabled, ns_string!("MuteBoardSounds"));
                         }
                     });
                 });
