@@ -176,6 +176,47 @@ pub fn missing_details(db: &Connection, after: i64) -> Result<Vec<i64>> {
         .query_map([after], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?)
 }
+/// A position before a reviewed mistake or blunder, to replay as a puzzle.
+pub struct Puzzle {
+    pub white: String,
+    pub black: String,
+    pub date: String,
+    pub position: shakmaty::Chess,
+    pub played: String,
+    pub best: String,
+    pub quality: crate::engine::Quality,
+}
+/// Mistakes and blunders from reviewed games, newest games first. A non-blank `player` keeps only
+/// moves by a side whose name contains every word of it (case-insensitive).
+pub fn mistakes(db: &Connection, player: &str) -> Result<Vec<Puzzle>> {
+    use crate::engine::Quality;
+    let words: Vec<String> = player.split_whitespace().map(str::to_lowercase).collect();
+    let mut puzzles = Vec::new();
+    // shortcut: parses every reviewed game on the UI thread; move to the worker if reviews number in the thousands.
+    let mut stmt = db.prepare("SELECT body FROM games WHERE instr(body, '\"review\":{') > 0 ORDER BY id DESC")?;
+    for body in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        let body = body?;
+        let game: Game = serde_json::from_str(&body)?;
+        let (Some(review), Ok(positions), Ok(replay)) = (&game.review, game.mainline_positions(), game.replay()) else { continue };
+        for m in review.moves.iter().filter(|m| matches!(m.quality, Quality::Mistake | Quality::Blunder)) {
+            let name = game.tag(if m.white { "White" } else { "Black" }).to_lowercase();
+            let Some(i) = positions.iter().position(|(node, _)| *node == m.node) else { continue };
+            if i == 0 || !words.iter().all(|w| name.contains(w.as_str())) {
+                continue;
+            }
+            puzzles.push(Puzzle {
+                white: game.tag("White").into(),
+                black: game.tag("Black").into(),
+                date: game.tag("Date").into(),
+                position: positions[i - 1].1.clone(),
+                played: replay.nodes[m.node].san.clone(),
+                best: m.best.clone(),
+                quality: m.quality,
+            });
+        }
+    }
+    Ok(puzzles)
+}
 pub fn last_id(db: &Connection) -> Result<i64> {
     Ok(db.query_row("SELECT coalesce(max(id), 0) FROM games", [], |r| r.get(0))?)
 }
@@ -585,6 +626,7 @@ mod tests {
             .unwrap();
         let branch = loaded.game.play(&mut replay, c5, movement).unwrap();
         loaded.notes.insert(branch, "Branch preparation".into());
+        let e5 = replay.nodes[1].children[0];
         loaded.game.review = Some(crate::engine::Report {
             moves: vec![crate::engine::ReviewedMove {
                 node: 1,
@@ -594,6 +636,15 @@ mod tests {
                 loss: 0.4,
                 score: "+0.2".into(),
                 best: "e4".into(),
+                depth: 16,
+            }, crate::engine::ReviewedMove {
+                node: e5,
+                white: false,
+                quality: crate::engine::Quality::Blunder,
+                accuracy: 10.0,
+                loss: 30.0,
+                score: "+3.0".into(),
+                best: "c5 Nf3".into(),
                 depth: 16,
             }],
             milliseconds_per_position: 500,
@@ -611,6 +662,11 @@ mod tests {
             Some(98.0)
         );
         assert_eq!(reopened.game.replay().unwrap().nodes[branch].san, "Nc3");
+        let puzzles = mistakes(&db, "").unwrap();
+        assert_eq!(puzzles.len(), 1, "only the blunder becomes a puzzle");
+        assert_eq!((puzzles[0].played.as_str(), puzzles[0].best.as_str()), ("e5", "c5 Nf3"));
+        assert_eq!(shakmaty::Position::turn(&puzzles[0].position), shakmaty::Color::Black);
+        assert!(mistakes(&db, "Tal").unwrap().is_empty());
         assert_eq!(
             search(
                 &db,

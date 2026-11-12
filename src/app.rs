@@ -45,11 +45,22 @@ struct Play {
     error: Option<String>,
     /// The library game that was open, restored when the player leaves.
     stash: (Option<Loaded>, Option<Replay>, usize),
+    /// Set when replaying reviewed mistakes instead of playing Stockfish.
+    train: Option<Train>,
+}
+
+struct Train {
+    puzzles: Vec<library::Puzzle>,
+    index: usize,
+    revealed: bool,
 }
 
 pub struct App {
     play: Option<Play>,
     play_setup: Option<PlaySettings>,
+    /// The "Train on mistakes" player field while its dialog is open; the name is kept for next time.
+    train_setup: bool,
+    train_player: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
     /// The last game id before the running import, so new games can be checked afterwards.
@@ -199,6 +210,8 @@ impl App {
         let mut app = Self {
             play: None,
             play_setup: None,
+            train_setup: false,
+            train_player: String::new(),
             jump: None,
             import_floor: 0,
             missing: Vec::new(),
@@ -692,16 +705,114 @@ impl App {
             ("Result".into(), "*".into()),
         ];
         // Play on from the position on the board; with no game open, from the start.
-        if let Some(position) = self.replay.as_ref().and_then(|r| r.nodes.get(self.current)?.position.as_ref()) {
+        let position = self.replay.as_ref().and_then(|r| r.nodes.get(self.current)?.position.clone());
+        let stash = (self.loaded.take(), self.replay.take(), self.current);
+        self.show_scratch(game, position.as_ref());
+        self.flipped = settings.human == Color::Black;
+        self.play = Some(Play { settings, job: None, error: None, stash, train: None });
+    }
+
+    /// Shows an unsaved game starting from `position` (the standard start when None).
+    fn show_scratch(&mut self, mut game: Game, position: Option<&shakmaty::Chess>) {
+        if let Some(position) = position {
             let fen = Fen::from_position(position, EnPassantMode::Legal).to_string();
             game.tags.extend([("SetUp".into(), "1".into()), ("FEN".into(), fen)]);
         }
-        let replay = game.replay().ok();
-        let stash = (self.loaded.take(), std::mem::replace(&mut self.replay, replay), self.current);
+        self.replay = game.replay().ok();
         self.loaded = Some(Loaded { id: -1, game, notes: Default::default(), starred: false });
         self.current = 0;
-        self.flipped = settings.human == Color::Black;
-        self.play = Some(Play { settings, job: None, error: None, stash });
+    }
+
+    fn start_training(&mut self) {
+        let puzzles = match library::mistakes(&self.db, &self.train_player) {
+            Ok(puzzles) => puzzles,
+            Err(e) => {
+                self.error = Some(format!("Could not collect mistakes: {e}"));
+                return;
+            }
+        };
+        if puzzles.is_empty() {
+            self.error = Some("No mistakes or blunders found. Run Analyze whole game on some games first, or check the player name.".into());
+            return;
+        }
+        if !self.save() {
+            return;
+        }
+        self.load_seq += 1;
+        self.loading = false;
+        let stash = (self.loaded.take(), self.replay.take(), self.current);
+        let settings = PlaySettings { human: Color::White, level: 0, show_evaluation: false };
+        self.play = Some(Play { settings, job: None, error: None, stash, train: Some(Train { puzzles, index: 0, revealed: false }) });
+        self.show_puzzle(0);
+    }
+
+    fn show_puzzle(&mut self, index: usize) {
+        let Some(play) = &mut self.play else { return };
+        let Some(train) = &mut play.train else { return };
+        train.index = index;
+        train.revealed = false;
+        let puzzle = &train.puzzles[index];
+        let mut game = Game::default();
+        game.tags = vec![
+            ("Event".into(), "Train on mistakes".into()),
+            ("White".into(), puzzle.white.clone()),
+            ("Black".into(), puzzle.black.clone()),
+            ("Result".into(), "*".into()),
+        ];
+        let position = puzzle.position.clone();
+        play.settings.human = position.turn();
+        self.flipped = position.turn() == Color::Black;
+        self.show_scratch(game, Some(&position));
+    }
+
+    fn train_panel(&mut self, ui: &mut egui::Ui) {
+        let (Some(play), Some(replay)) = (&mut self.play, &self.replay) else { return };
+        let Some(train) = &mut play.train else { return };
+        let (index, total) = (train.index, train.puzzles.len());
+        let puzzle = &train.puzzles[index];
+        section(ui, "Train on mistakes", &format!("Puzzle {} of {total}", index + 1));
+        ui.label(format!("{} — {} · {}", puzzle.white, puzzle.black, puzzle.date));
+        let side = if puzzle.position.turn() == Color::White { "White" } else { "Black" };
+        ui.label(format!("{side} to move. The game went {} here, a {}. Find a better move.", puzzle.played, puzzle.quality.label().to_lowercase()));
+        ui.add_space(6.0);
+        let parse = |san: &str| san.parse::<shakmaty::san::SanPlus>().ok()?.san.to_move(&puzzle.position).ok();
+        let best = puzzle.best.split_whitespace().next().and_then(parse);
+        // The board locks after one move, so the board shows either the puzzle or one reply to it.
+        if self.current == 0 {
+            ui.label(RichText::new("Your move").strong());
+        } else {
+            let san = &replay.nodes[self.current].san;
+            let tried = parse(san);
+            if tried.is_some() && tried == best {
+                ui.label(RichText::new(format!("Correct — {san} is the engine's move.")).strong());
+            } else if tried.is_some() && tried == parse(&puzzle.played) {
+                ui.label("That's the move from the game. Try again.");
+            } else {
+                ui.label(format!("{san} isn't the engine's choice. Try again or show the answer."));
+            }
+        }
+        let mut revealed = train.revealed;
+        if revealed {
+            ui.label(format!("Engine line: {}", puzzle.best));
+        }
+        let (mut retry, mut next) = (false, false);
+        ui.horizontal(|ui| {
+            retry = ui.add_enabled(self.current != 0, egui::Button::new("Try again")).clicked();
+            revealed |= ui.add_enabled(!revealed, egui::Button::new("Show answer")).clicked();
+            next = ui.button(if index + 1 < total { "Next puzzle" } else { "Finish" }).clicked();
+        });
+        train.revealed = revealed;
+        ui.small("Moves are checked against the review's best move; another strong move may also hold.");
+        if retry {
+            self.current = 0;
+        }
+        if next {
+            if index + 1 < total {
+                self.show_puzzle(index + 1);
+            } else {
+                self.leave_play();
+            }
+        }
     }
 
     fn leave_play(&mut self) {
@@ -714,6 +825,9 @@ impl App {
     fn play_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.position_changed();
         self.poll_analysis();
+        if self.play.as_ref().is_some_and(|p| p.train.is_some()) {
+            return self.train_panel(ui);
+        }
         let (Some(play), Some(loaded), Some(replay)) = (&mut self.play, &mut self.loaded, &mut self.replay) else { return };
         let mut moved = None;
         if let Some((node, job)) = &play.job {
@@ -1341,6 +1455,7 @@ impl App {
             let loaded = self.loaded.as_ref().unwrap();
             let title = format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black"));
             let subtitle = match &self.play {
+                Some(play) if play.train.is_some() => "Train on mistakes  ·  find the better move".into(),
                 Some(play) => format!("Play vs computer  ·  you play {}", if play.settings.human == Color::White { "White" } else { "Black" }),
                 None => format!("{}  ·  {}  ·  {}",loaded.game.tag("Event"),loaded.game.tag("Date"),loaded.game.tag("Result")),
             };
@@ -1810,16 +1925,26 @@ impl eframe::App for App {
                         {
                             self.choose_import(ctx);
                         }
-                        if self.play.is_some() {
-                            if ui.add(egui::Button::new("Leave game").fill(GREEN)).clicked() {
+                        if let Some(play) = &self.play {
+                            let label = if play.train.is_some() { "Leave training" } else { "Leave game" };
+                            if ui.add(egui::Button::new(label).fill(GREEN)).clicked() {
                                 self.leave_play();
                             }
-                        } else if ui
-                            .add_enabled(self.engine_path.is_some(), egui::Button::new("Play vs computer").fill(GREEN))
-                            .on_disabled_hover_text("Choose a Stockfish executable to play")
-                            .clicked()
-                        {
-                            self.play_setup = Some(PlaySettings { human: Color::White, level: 5, show_evaluation: true });
+                        } else {
+                            if ui
+                                .add_enabled(self.engine_path.is_some(), egui::Button::new("Play vs computer").fill(GREEN))
+                                .on_disabled_hover_text("Choose a Stockfish executable to play")
+                                .clicked()
+                            {
+                                self.play_setup = Some(PlaySettings { human: Color::White, level: 5, show_evaluation: true });
+                            }
+                            if ui
+                                .add(egui::Button::new("Train on mistakes").fill(GREEN))
+                                .on_hover_text("Replay positions where reviewed games went wrong")
+                                .clicked()
+                            {
+                                self.train_setup = true;
+                            }
                         }
                         ui.add_space(8.0);
                         if ui.checkbox(&mut self.sounds_enabled, RichText::new("Sounds").color(IVORY)).changed() {
@@ -1891,6 +2016,34 @@ impl eframe::App for App {
                 self.start_play(settings);
             } else if cancel {
                 self.play_setup = None;
+            }
+        }
+        if self.train_setup {
+            let (mut start, mut cancel) = (false, false);
+            egui::Window::new("Train on mistakes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Puzzles from mistakes and blunders in games you have reviewed.");
+                    ui.horizontal(|ui| {
+                        ui.label("Player");
+                        let field = ui.add(egui::TextEdit::singleline(&mut self.train_player).hint_text("Both sides").desired_width(220.0));
+                        start = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    });
+                    ui.small("Only moves by a player whose name contains these words.");
+                    ui.horizontal(|ui| {
+                        start |= ui
+                            .add(egui::Button::new(RichText::new("Start").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT)))
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            if start {
+                self.train_setup = false;
+                self.start_training();
+            } else if cancel {
+                self.train_setup = false;
             }
         }
         if let Some((query, rows, highlight)) = &mut self.jump {
