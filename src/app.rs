@@ -1,7 +1,7 @@
 use crate::{
     engine,
     library::{self, Event, Filter, ImportStats, Loaded, Page, Request},
-    pgn::Replay,
+    pgn::{Game, Replay},
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
 use objc2::{AnyThread, rc::Retained};
@@ -30,7 +30,26 @@ const RIBBON_LIGHT: Color32 = Color32::from_rgb(239, 116, 33);
 const INK: Color32 = Color32::from_rgb(38, 40, 32);
 const MUTED: Color32 = Color32::from_rgb(112, 100, 80);
 
+#[derive(Clone, Copy)]
+struct PlaySettings {
+    human: Color,
+    level: u8,
+    show_evaluation: bool,
+}
+
+/// A game against Stockfish, kept in memory and never saved to the library.
+struct Play {
+    settings: PlaySettings,
+    /// The computer's search and the node it is replying to.
+    job: Option<(usize, engine::Job)>,
+    error: Option<String>,
+    /// The library game that was open, restored when the player leaves.
+    stash: (Option<Loaded>, Option<Replay>, usize),
+}
+
 pub struct App {
+    play: Option<Play>,
+    play_setup: Option<PlaySettings>,
     db: rusqlite::Connection,
     path: PathBuf,
     requests: mpsc::Sender<Request>,
@@ -171,6 +190,8 @@ impl App {
         );
         let (requests, events, receive) = library::worker(path.clone(), ctx.clone());
         let mut app = Self {
+            play: None,
+            play_setup: None,
             db,
             path,
             requests,
@@ -251,6 +272,10 @@ impl App {
         self.search_due = None;
     }
     fn save(&mut self) -> bool {
+        if self.play.is_some() {
+            self.dirty = false;
+            return true;
+        }
         if !self.dirty {
             return true;
         }
@@ -615,6 +640,107 @@ impl App {
         }
     }
 
+    fn start_play(&mut self, settings: PlaySettings) {
+        if !self.save() {
+            return;
+        }
+        // Drop any library game still loading so it cannot replace the new game.
+        self.load_seq += 1;
+        self.loading = false;
+        let computer = format!("Stockfish level {}", settings.level);
+        let mut game = Game::default();
+        game.tags = vec![
+            ("Event".into(), "Play vs computer".into()),
+            ("White".into(), if settings.human == Color::White { "You".into() } else { computer.clone() }),
+            ("Black".into(), if settings.human == Color::Black { "You".into() } else { computer }),
+            ("Result".into(), "*".into()),
+        ];
+        // Play on from the position on the board; with no game open, from the start.
+        if let Some(position) = self.replay.as_ref().and_then(|r| r.nodes.get(self.current)?.position.as_ref()) {
+            let fen = Fen::from_position(position, EnPassantMode::Legal).to_string();
+            game.tags.extend([("SetUp".into(), "1".into()), ("FEN".into(), fen)]);
+        }
+        let replay = game.replay().ok();
+        let stash = (self.loaded.take(), std::mem::replace(&mut self.replay, replay), self.current);
+        self.loaded = Some(Loaded { id: -1, game, notes: Default::default(), starred: false });
+        self.current = 0;
+        self.flipped = settings.human == Color::Black;
+        self.play = Some(Play { settings, job: None, error: None, stash });
+    }
+
+    fn leave_play(&mut self) {
+        if let Some(play) = self.play.take() {
+            (self.loaded, self.replay, self.current) = play.stash;
+            self.dirty = false;
+        }
+    }
+
+    fn play_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.position_changed();
+        self.poll_analysis();
+        let (Some(play), Some(loaded), Some(replay)) = (&mut self.play, &mut self.loaded, &mut self.replay) else { return };
+        let mut moved = None;
+        if let Some((node, job)) = &play.job {
+            while let Ok(event) = job.receive.try_recv() {
+                if let engine::Event::Moved(result) = event {
+                    moved = Some((*node, result));
+                }
+            }
+        }
+        if let Some((node, result)) = moved {
+            play.job = None;
+            match result.and_then(|movement| loaded.game.play(replay, node, movement)) {
+                // The reply lands even if the player stepped back; the board follows only from the tip.
+                Ok(id) if self.current == node => self.current = id,
+                Ok(_) => {}
+                Err(e) => play.error = Some(e.to_string()),
+            }
+        }
+        let human = play.settings.human;
+        section(ui, "Play vs Stockfish", &format!("Level {}", play.settings.level));
+        let Some(position) = replay.nodes[self.current].position.clone() else { return };
+        let over = position.outcome().known();
+        if let Some(path) = &self.engine_path {
+            if over.is_none()
+                && position.turn() != human
+                && replay.nodes[self.current].children.is_empty()
+                && play.job.is_none()
+                && play.error.is_none()
+            {
+                play.job = Some((self.current, engine::start_move(path.clone(), position.clone(), play.settings.level, ctx.clone())));
+            }
+            if play.settings.show_evaluation && over.is_none() && self.analysis.is_none() && self.analysis_error.is_none() {
+                self.analysis = Some(engine::start(path.clone(), position.clone(), true, 1, ctx.clone()));
+            }
+        }
+        if let Some(outcome) = over {
+            ui.label(RichText::new(match outcome.winner() {
+                Some(winner) if winner == human => "Checkmate — you win",
+                Some(_) => "Checkmate — Stockfish wins",
+                None => "Draw",
+            }).strong());
+        } else if play.job.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Stockfish is thinking…");
+            });
+        } else if position.turn() == human {
+            ui.label(RichText::new("Your move").strong());
+        } else if play.error.is_none() {
+            ui.label("Stockfish to move. Return to the last move to continue.");
+        }
+        if let Some(error) = play.error.clone() {
+            ui.colored_label(Color32::DARK_RED, error);
+            if ui.button("Try again").clicked() {
+                play.error = None;
+            }
+        }
+        if let Some(error) = &self.analysis_error {
+            ui.colored_label(Color32::DARK_RED, error);
+        }
+        ui.small("Step back and play a different move to take one back.");
+    }
+
     fn position_changed(&mut self) {
         let key = self.loaded.as_ref().map(|g| (g.id, self.current));
         let game = self.loaded.as_ref().map(|g| g.id);
@@ -657,8 +783,7 @@ impl App {
         }
     }
 
-    fn engine_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.position_changed();
+    fn poll_analysis(&mut self) {
         let mut finished = None;
         if let Some(job) = &self.analysis {
             while let Ok(event) = job.receive.try_recv() {
@@ -680,6 +805,11 @@ impl App {
                 self.continuous = false;
             }
         }
+    }
+
+    fn engine_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.position_changed();
+        self.poll_analysis();
         let mut reviewed = None;
         if let Some(job) = &self.review_job {
             while let Ok(event) = job.receive.try_recv() {
@@ -1063,70 +1193,74 @@ impl App {
                                 ui.colored_label(Color32::from_rgb(163, 91, 36), warning);
                             }
                         }
-                        let title = self
-                            .replay
-                            .as_ref()
-                            .filter(|_| self.current > 0)
-                            .map(|r| format!("Notes after {}", r.label(self.current)))
-                            .unwrap_or_else(|| "Game notes".into());
-                        // The rule between moves and notes is a drag handle for the move list height.
-                        ui.add_space(6.0);
-                        let (rule, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), egui::Sense::drag());
-                        let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
-                        if drag.dragged() {
-                            self.moves_height = (self.moves_height + drag.drag_delta().y).clamp(80.0, 900.0);
-                        }
-                        if drag.drag_stopped() {
-                            NSUserDefaults::standardUserDefaults()
-                                .setDouble_forKey(self.moves_height as _, ns_string!("MovesHeight"));
-                        }
-                        let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
-                        ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
-                        ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
-                        // Notes autosave shortly after typing; ⌘S saves immediately.
-                        header(ui, title, if self.dirty { "Unsaved" } else { "Saved" });
-                        if let Some(loaded) = &mut self.loaded {
-                            let note = loaded.notes.entry(self.current).or_default();
-                            let sheet = ui.painter().add(egui::Shape::Noop);
-                            let response = ui.add(
-                                egui::TextEdit::multiline(note)
-                                    .id_salt((loaded.id, self.current))
-                                    .hint_text("Plans, ideas, things to remember…")
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(5)
-                                    .frame(false)
-                                    .margin(egui::Margin { left: 14, right: 6, top: 4, bottom: 4 }),
-                            );
-                            // Ruled notepaper behind the text: rules sit on each text baseline.
-                            let rect = response.rect;
-                            let row = ui.fonts_mut(|f| f.row_height(&egui::TextStyle::Body.resolve(ui.style())));
-                            let focused = response.has_focus();
-                            let mut shapes = vec![
-                                egui::Shape::rect_filled(rect, 4, ui.visuals().extreme_bg_color),
-                                egui::Shape::vline(rect.left() + 9.5, rect.y_range(), egui::Stroke::new(1.0_f32, RIBBON.gamma_multiply(0.45))),
-                            ];
-                            let mut y = rect.top() + 4.0 + row;
-                            while y < rect.bottom() - 2.0 {
-                                shapes.push(egui::Shape::hline(rect.x_range().shrink(2.0), y.round() + 0.5, egui::Stroke::new(1.0_f32, FOLD.gamma_multiply(0.7))));
-                                y += row;
+                        if self.play.is_some() {
+                            self.play_panel(ui, ctx);
+                        } else {
+                            let title = self
+                                .replay
+                                .as_ref()
+                                .filter(|_| self.current > 0)
+                                .map(|r| format!("Notes after {}", r.label(self.current)))
+                                .unwrap_or_else(|| "Game notes".into());
+                            // The rule between moves and notes is a drag handle for the move list height.
+                            ui.add_space(6.0);
+                            let (rule, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), egui::Sense::drag());
+                            let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                            if drag.dragged() {
+                                self.moves_height = (self.moves_height + drag.drag_delta().y).clamp(80.0, 900.0);
                             }
-                            shapes.push(egui::Shape::rect_stroke(rect, 4, egui::Stroke::new(1.0_f32, if focused { GREEN } else { BEVEL }), egui::StrokeKind::Inside));
-                            ui.painter().set(sheet, egui::Shape::Vec(shapes));
-                            top_shadow(ui.painter(), rect.shrink(1.0), 3);
-                            if response.changed() {
-                                self.dirty = true;
-                                self.edited = Instant::now();
+                            if drag.drag_stopped() {
+                                NSUserDefaults::standardUserDefaults()
+                                    .setDouble_forKey(self.moves_height as _, ns_string!("MovesHeight"));
                             }
-                        }
-                        if let Some(replay) = &self.replay {
-                            for annotation in &replay.nodes[self.current].annotations {
-                                if let crate::pgn::Token::Comment(text) = annotation {
-                                    ui.label(text);
+                            let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
+                            ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
+                            ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
+                            // Notes autosave shortly after typing; ⌘S saves immediately.
+                            header(ui, title, if self.dirty { "Unsaved" } else { "Saved" });
+                            if let Some(loaded) = &mut self.loaded {
+                                let note = loaded.notes.entry(self.current).or_default();
+                                let sheet = ui.painter().add(egui::Shape::Noop);
+                                let response = ui.add(
+                                    egui::TextEdit::multiline(note)
+                                        .id_salt((loaded.id, self.current))
+                                        .hint_text("Plans, ideas, things to remember…")
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(5)
+                                        .frame(false)
+                                        .margin(egui::Margin { left: 14, right: 6, top: 4, bottom: 4 }),
+                                );
+                                // Ruled notepaper behind the text: rules sit on each text baseline.
+                                let rect = response.rect;
+                                let row = ui.fonts_mut(|f| f.row_height(&egui::TextStyle::Body.resolve(ui.style())));
+                                let focused = response.has_focus();
+                                let mut shapes = vec![
+                                    egui::Shape::rect_filled(rect, 4, ui.visuals().extreme_bg_color),
+                                    egui::Shape::vline(rect.left() + 9.5, rect.y_range(), egui::Stroke::new(1.0_f32, RIBBON.gamma_multiply(0.45))),
+                                ];
+                                let mut y = rect.top() + 4.0 + row;
+                                while y < rect.bottom() - 2.0 {
+                                    shapes.push(egui::Shape::hline(rect.x_range().shrink(2.0), y.round() + 0.5, egui::Stroke::new(1.0_f32, FOLD.gamma_multiply(0.7))));
+                                    y += row;
+                                }
+                                shapes.push(egui::Shape::rect_stroke(rect, 4, egui::Stroke::new(1.0_f32, if focused { GREEN } else { BEVEL }), egui::StrokeKind::Inside));
+                                ui.painter().set(sheet, egui::Shape::Vec(shapes));
+                                top_shadow(ui.painter(), rect.shrink(1.0), 3);
+                                if response.changed() {
+                                    self.dirty = true;
+                                    self.edited = Instant::now();
                                 }
                             }
+                            if let Some(replay) = &self.replay {
+                                for annotation in &replay.nodes[self.current].annotations {
+                                    if let crate::pgn::Token::Comment(text) = annotation {
+                                        ui.label(text);
+                                    }
+                                }
+                            }
+                            self.engine_panel(ui, ctx);
+                            self.review_panel(ui, ctx);
                         }
-                        self.engine_panel(ui, ctx);
-                        self.review_panel(ui, ctx);
                         ui.add_space(6.0);
                         ui.separator();
                         ui.collapsing("Game details & PGN", |ui| {
@@ -1170,12 +1304,15 @@ impl App {
             }
             let loaded = self.loaded.as_ref().unwrap();
             let title = format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black"));
-            let subtitle = format!("{}  ·  {}  ·  {}",loaded.game.tag("Event"),loaded.game.tag("Date"),loaded.game.tag("Result"));
+            let subtitle = match &self.play {
+                Some(play) => format!("Play vs computer  ·  you play {}", if play.settings.human == Color::White { "White" } else { "Black" }),
+                None => format!("{}  ·  {}  ·  {}",loaded.game.tag("Event"),loaded.game.tag("Date"),loaded.game.tag("Result")),
+            };
             ui.label(RichText::new("GAME WORKSPACE").size(11.0).strong().color(GREEN));
             ui.horizontal(|ui| {
                 ui.heading(title);
                 let starred = self.loaded.as_ref().unwrap().starred;
-                if ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
+                if self.play.is_none() && ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
                     let loaded = self.loaded.as_mut().unwrap(); loaded.starred = !loaded.starred; self.dirty=true; self.edited=Instant::now();
                     if self.save() { self.refresh(false); }
                 }
@@ -1207,6 +1344,7 @@ impl App {
             // Squares sit in a shallow recess pressed into the cover.
             painter.rect_stroke(squares, 0, egui::Stroke::new(3.0_f32, CLOTH_SHADOW), egui::StrokeKind::Outside);
             painter.hline(squares.x_range().expand(3.0), squares.bottom() + 3.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(30)));
+            if self.play.as_ref().is_none_or(|p| p.settings.show_evaluation) {
             let saved_score = self.loaded.as_ref().and_then(|g| g.game.review.as_ref())
                 .and_then(|report| report.moves.iter().find(|m| m.node == self.current)).map(|m| m.score.as_str());
             let score = self.lines.first().map(|e| e.score.as_str()).or(saved_score);
@@ -1238,7 +1376,11 @@ impl App {
             top_shadow(painter, bar, 4);
             painter.vline(bar.left() + 0.5, bar.y_range(), egui::Stroke::new(1.0_f32, Color32::from_black_alpha(40)));
             painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.0_f32, BEVEL), egui::StrokeKind::Outside);
+            }
+            let painter = ui.painter();
             let legal = pos.legal_moves();
+            // Against the computer, only the player's own pieces move.
+            let can_move = !self.loading && self.play.as_ref().is_none_or(|p| p.settings.human == pos.turn());
             let mut clicked = None;
             let mut dragged = None;
             let mut drop = false;
@@ -1308,7 +1450,7 @@ impl App {
                 let square_label = piece.map(|piece| format!("{square}: {:?} {:?}", piece.color, piece.role)).unwrap_or_else(|| format!("{square}: empty"));
                 let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click_and_drag());
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !self.loading, &square_label));
-                let own_piece = piece.filter(|p| p.color == pos.turn() && !self.loading);
+                let own_piece = piece.filter(|p| p.color == pos.turn() && can_move);
                 if response.drag_started() && own_piece.is_some() { self.selected_square = Some(square); }
                 if self.selected_square == Some(square) && own_piece.is_some() {
                     if response.dragged() { dragged = own_piece; }
@@ -1365,7 +1507,7 @@ impl App {
             }
             // Engine lines as arrows over the pieces, weakest first so the best sits on top.
             // The legality check guards a stale evaluation.
-            for line in self.lines.iter().rev() {
+            for line in self.lines.iter().rev().filter(|_| self.play.is_none()) {
                 let Some(best) = line.best.filter(|m| legal.contains(m)) else { continue };
                 let top = line.multipv == 1;
                 let (head, width) = if top { (cell * 0.4, cell * 0.16) } else { (cell * 0.32, cell * 0.11) };
@@ -1440,7 +1582,7 @@ impl App {
                 }).collect())
                 .unwrap_or_default();
             if points.is_empty() {
-                ui.small("Run a game review to see the evaluation graph.");
+                if self.play.is_none() { ui.small("Run a game review to see the evaluation graph."); }
             } else {
                 ui.add_space(6.0);
                 let (graph, response) = ui.allocate_exact_size(Vec2::new(cover.width(), 80.0), egui::Sense::click());
@@ -1473,7 +1615,7 @@ impl App {
                 ui.painter().rect_stroke(graph, 0, egui::Stroke::new(1.0_f32, BEVEL), egui::StrokeKind::Outside);
             }
             });
-            if let Some(square) = clicked && !self.loading {
+            if let Some(square) = clicked && can_move {
                 if let Some(from) = self.selected_square {
                     let candidates: Vec<_> = legal.iter().copied().filter(|m| m.from() == Some(from) && move_destination(*m) == square).collect();
                     if candidates.len() == 1 { self.dropped = drop; self.play(candidates[0]); }
@@ -1600,7 +1742,7 @@ impl eframe::App for App {
                         }
                         if ui
                             .add_enabled(
-                                self.loaded.is_some() && !self.exporting,
+                                self.loaded.is_some() && self.play.is_none() && !self.exporting,
                                 egui::Button::new("Export game").fill(GREEN),
                             )
                             .clicked()
@@ -1617,6 +1759,17 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.choose_import(ctx);
+                        }
+                        if self.play.is_some() {
+                            if ui.add(egui::Button::new("Leave game").fill(GREEN)).clicked() {
+                                self.leave_play();
+                            }
+                        } else if ui
+                            .add_enabled(self.engine_path.is_some(), egui::Button::new("Play vs computer").fill(GREEN))
+                            .on_disabled_hover_text("Choose a Stockfish executable to play")
+                            .clicked()
+                        {
+                            self.play_setup = Some(PlaySettings { human: Color::White, level: 5, show_evaluation: true });
                         }
                         ui.add_space(8.0);
                         if ui.checkbox(&mut self.sounds_enabled, RichText::new("Sounds").color(IVORY)).changed() {
@@ -1652,11 +1805,44 @@ impl eframe::App for App {
                     }
                 });
             });
-        self.sidebar(ctx);
+        if self.play.is_none() {
+            self.sidebar(ctx);
+        }
         self.notebook(ctx);
         self.position_changed();
         self.board(ctx);
         self.position_changed();
+        if let Some(settings) = &mut self.play_setup {
+            let (mut start, mut cancel) = (false, false);
+            egui::Window::new("Play vs computer")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut settings.human, Color::White, "As White");
+                        ui.selectable_value(&mut settings.human, Color::Black, "As Black");
+                    });
+                    ui.add(egui::Slider::new(&mut settings.level, 0..=20).text("Stockfish level"));
+                    ui.checkbox(&mut settings.show_evaluation, "Show evaluation");
+                    if self.replay.is_some() {
+                        ui.small("Starts from the position on the board.");
+                    }
+                    ui.horizontal(|ui| {
+                        start = ui
+                            .add(egui::Button::new(RichText::new("Start").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT)))
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            if start {
+                let settings = *settings;
+                self.play_setup = None;
+                self.start_play(settings);
+            } else if cancel {
+                self.play_setup = None;
+            }
+        }
         if !self.promotion.is_empty() {
             egui::Window::new("Promote pawn")
                 .collapsible(false)

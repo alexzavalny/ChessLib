@@ -29,6 +29,8 @@ pub enum Event {
     Finished(Result<()>),
     Progress { done: usize, total: usize },
     Reviewed(Result<Report>),
+    /// The computer's reply in a game against it.
+    Moved(Result<Move>),
 }
 
 pub struct Job {
@@ -85,6 +87,20 @@ pub fn start(
             Ok(())
         })();
         emit(Event::Finished(result));
+    })
+}
+
+/// Stockfish picks a reply, weakened by UCI `Skill Level` (0–20).
+pub fn start_move(path: PathBuf, position: Chess, level: u8, ctx: eframe::egui::Context) -> Job {
+    spawn(ctx, move |cancel, emit| {
+        let result = (|| {
+            let mut engine = Engine::new(path, cancel)?;
+            writeln!(engine.input, "setoption name Skill Level value {}", level.min(20))?;
+            // shortcut: sends only the FEN, so Stockfish cannot see repetitions; send the move list if draws by repetition matter.
+            let evaluation = engine.analyze(&position, &position_command(&position, &[]), Some(800), cancel, |_| {})?;
+            evaluation.best.context("Stockfish found no move")
+        })();
+        emit(Event::Moved(result));
     })
 }
 
@@ -217,8 +233,17 @@ impl Engine {
                     latest = Some(evaluation);
                 }
             }
-            if line.starts_with("bestmove ") {
-                return latest.context("Stockfish returned no usable evaluation");
+            if let Some(rest) = line.strip_prefix("bestmove ") {
+                let mut latest = latest.context("Stockfish returned no usable evaluation")?;
+                // With a Skill Level set, bestmove can differ from the top line's first move.
+                if let Some(movement) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|uci| uci.parse::<UciMove>().ok()?.to_move(position).ok())
+                {
+                    latest.best = Some(movement);
+                }
+                return Ok(latest);
             }
         }
     }
@@ -666,6 +691,13 @@ mod tests {
         )
         .unwrap();
         assert!(updates.iter().any(|e| e.depth > 0 && e.best.is_some()));
+        let mut weak = Engine::new(path.clone(), &AtomicBool::new(false)).unwrap();
+        writeln!(weak.input, "setoption name Skill Level value 0").unwrap();
+        let position = Chess::default();
+        let reply = weak
+            .analyze(&position, &position_command(&position, &[]), Some(300), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert!(position.is_legal(reply.best.unwrap()));
         let cancel = AtomicBool::new(false);
         let now = Instant::now();
         assert!(
