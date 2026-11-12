@@ -31,4 +31,4 @@ Use broad, soft light and short contact shadows. Let fine grain and a shallow be
 
 ## Board reference
 
-The board uses lighter tints for playability. The current tint inputs are very light beige `#FFFAE7` and muted green `#719C7A`. The [bookcloth texture](../assets/bookcloth.png) is applied over both colors and repeated four times across each board axis. Keep the weave this fine and check it at the default and smallest supported window sizes. Check both piece colors on both squares and keep move highlights easy to spot.
+The board uses lighter tints for playability. The current tint inputs are very light beige `#FFFAE7` and muted sage green `#809D84`. The [bookcloth texture](../assets/bookcloth.png) is applied over both colors and repeated four times across each board axis. Keep the weave this fine and check it at the default and smallest supported window sizes. Check both piece colors on both squares and keep move highlights easy to spot.

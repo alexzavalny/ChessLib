@@ -626,11 +626,6 @@ impl App {
                                     .selected(selected)
                                     .frame(selected),
                             );
-                            if selected {
-                                // A ribbon marks the open game, like a bookmark between pages.
-                                let r = response.rect;
-                                ribbon(ui.painter(), &cloth, r.left() + 12.0, r.top(), Vec2::new(11.0, 22.0));
-                            }
                             if response.clicked() {
                                 self.select(row.id);
                             }
@@ -1551,7 +1546,7 @@ impl App {
                 let (column, lift) = match piece.role {
                     Role::King => (0, 0.0),
                     Role::Queen => (1, 0.04),
-                    Role::Bishop => (2, 0.05),
+                    Role::Bishop => (2, 0.0),
                     Role::Knight => (3, 0.05),
                     Role::Rook => (4, 0.07),
                     Role::Pawn => (5, 0.09),
@@ -1599,7 +1594,7 @@ impl App {
                     (_, true, true) => Color32::from_rgb(241, 239, 169),
                     (_, true, false) => Color32::from_rgb(181, 193, 119),
                     (_, false, true) => Color32::from_rgb(255, 250, 231),
-                    (_, false, false) => Color32::from_rgb(113, 156, 122),
+                    (_, false, false) => Color32::from_rgb(128, 157, 132),
                 };
                 let cloth_uv = egui::Rect::from_min_size(
                     egui::pos2(col as f32 * 0.5, row as f32 * 0.5),
