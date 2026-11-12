@@ -484,6 +484,7 @@ impl App {
                                     ));
                                 }
                             }
+                            self.flipped = loaded.game.flipped;
                             self.loaded = Some(loaded);
                             self.current = 0;
                             self.scrolled_node = None;
@@ -910,7 +911,18 @@ impl App {
     fn leave_play(&mut self) {
         if let Some(play) = self.play.take() {
             (self.loaded, self.replay, self.current) = play.stash;
+            self.flipped = self.loaded.as_ref().is_some_and(|l| l.game.flipped);
             self.dirty = false;
+        }
+    }
+
+    /// Flips the board and remembers it with the game.
+    fn flip(&mut self) {
+        self.flipped = !self.flipped;
+        if let Some(loaded) = &mut self.loaded {
+            loaded.game.flipped = self.flipped;
+            self.dirty = true;
+            self.edited = Instant::now();
         }
     }
 
@@ -1867,7 +1879,11 @@ impl App {
                 ui.label(format!("{move_number} / {line_length}"));
                 if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
                 if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
-                if ui.button("Flip").on_hover_text("Flip the board (F)").clicked() { self.flipped = !self.flipped; }
+                if ui.button("Flip").on_hover_text("Flip the board (F)").clicked() {
+                    // Field by field: `self.flip()` would clash with the borrowed replay.
+                    self.flipped = !self.flipped;
+                    if let Some(loaded) = &mut self.loaded { loaded.game.flipped = self.flipped; self.dirty = true; self.edited = Instant::now(); }
+                }
                 if ui.button("Copy FEN").on_hover_text(&fen).clicked() {
                     ctx.copy_text(fen.clone());
                     self.status = "Position copied".into();
@@ -1967,7 +1983,7 @@ impl eframe::App for App {
         let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
         if !ctx.wants_keyboard_input() {
             if plain(egui::Key::F) {
-                self.flipped = !self.flipped;
+                self.flip();
             }
             if plain(egui::Key::L) && self.engine_path.is_some() {
                 self.continuous = !self.continuous;
