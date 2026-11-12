@@ -50,6 +50,8 @@ struct Play {
 pub struct App {
     play: Option<Play>,
     play_setup: Option<PlaySettings>,
+    /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
+    jump: Option<(String, Vec<library::Row>, usize)>,
     db: rusqlite::Connection,
     path: PathBuf,
     requests: mpsc::Sender<Request>,
@@ -192,6 +194,7 @@ impl App {
         let mut app = Self {
             play: None,
             play_setup: None,
+            jump: None,
             db,
             path,
             requests,
@@ -1662,6 +1665,9 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
+        if self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.jump = Some((String::new(), library::jump(&self.db, "").unwrap_or_default(), 0));
+        }
         let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
         if !ctx.wants_keyboard_input() {
             if plain(egui::Key::F) {
@@ -1841,6 +1847,70 @@ impl eframe::App for App {
                 self.start_play(settings);
             } else if cancel {
                 self.play_setup = None;
+            }
+        }
+        if let Some((query, rows, highlight)) = &mut self.jump {
+            let (mut open, mut close) = (None, false);
+            let modal = egui::Modal::new(egui::Id::new("jump")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Jump to game");
+                // Take the arrows and Return before the text field moves its cursor on them.
+                let (up, down, enter) = ui.input_mut(|i| {
+                    (
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    )
+                });
+                let field = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text("Players, e.g. Gri Pla")
+                        .desired_width(f32::INFINITY),
+                );
+                field.request_focus();
+                if field.changed() {
+                    // shortcut: queries on the UI thread (~40 ms worst case at 100k games); move to the worker if libraries grow far past that.
+                    match library::jump(&self.db, query) {
+                        Ok(found) => *rows = found,
+                        Err(e) => self.error = Some(format!("Could not search library: {e}")),
+                    }
+                    *highlight = 0;
+                }
+                if down {
+                    *highlight = (*highlight + 1).min(rows.len().saturating_sub(1));
+                }
+                if up {
+                    *highlight = highlight.saturating_sub(1);
+                }
+                if enter {
+                    open = rows.get(*highlight).map(|r| r.id);
+                }
+                ui.add_space(6.0);
+                if rows.is_empty() {
+                    ui.label("No matching games.");
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for (i, row) in rows.iter().enumerate() {
+                        let text = format!("{}  —  {}\n{} · {}", row.white, row.black, row.event, row.date);
+                        let response = ui.add_sized(
+                            [ui.available_width(), 44.0],
+                            egui::Button::new(text).selected(i == *highlight).frame(i == *highlight),
+                        );
+                        if i == *highlight && (up || down) {
+                            response.scroll_to_me(None);
+                        }
+                        if response.clicked() {
+                            open = Some(row.id);
+                        }
+                    }
+                });
+                close = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+            if let Some(id) = open {
+                self.jump = None;
+                self.select(id);
+            } else if close || modal.should_close() {
+                self.jump = None;
             }
         }
         if !self.promotion.is_empty() {

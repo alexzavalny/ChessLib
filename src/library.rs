@@ -88,6 +88,37 @@ pub struct Loaded {
     pub starred: bool,
 }
 
+fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
+    Ok(Row {
+        id: r.get(0)?,
+        white: r.get(1)?,
+        black: r.get(2)?,
+        event: r.get(3)?,
+        date: r.get(4)?,
+        result: r.get(5)?,
+        eco: r.get(6)?,
+        starred: r.get(7)?,
+    })
+}
+
+/// Games whose players contain every word of `query` anywhere, newest first: "Gri Pla" finds
+/// "Grigorijs … vs Platons …". Case-insensitive for ASCII only (SQLite LIKE).
+pub fn jump(db: &Connection, query: &str) -> Result<Vec<Row>> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .take(16)
+        .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
+        .collect();
+    let sql = format!(
+        "SELECT id, white, black, event, date, result, eco, starred FROM games WHERE 1 {} ORDER BY id DESC LIMIT 20",
+        " AND (white || ' ' || black) LIKE ? ESCAPE '\\'".repeat(words.len())
+    );
+    Ok(db
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(words), row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
     let clause = filter.clause();
     let fts = filter.fts();
@@ -107,18 +138,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
                 before,
                 PAGE_SIZE as i64 + 1
             ],
-            |r| {
-                Ok(Row {
-                    id: r.get(0)?,
-                    white: r.get(1)?,
-                    black: r.get(2)?,
-                    event: r.get(3)?,
-                    date: r.get(4)?,
-                    result: r.get(5)?,
-                    eco: r.get(6)?,
-                    starred: r.get(7)?,
-                })
-            },
+            row,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let more = rows.len() > PAGE_SIZE;
@@ -409,6 +429,9 @@ mod tests {
         let search_time = now.elapsed();
         assert_eq!(found.total, 1);
         let now = Instant::now();
+        assert!(jump(&db, "nobody here").unwrap().is_empty());
+        let jump_time = now.elapsed();
+        let now = Instant::now();
         let deep = search(&db, &Filter::default(), 1000).unwrap();
         let deep_time = now.elapsed();
         assert_eq!(deep.rows.len(), PAGE_SIZE);
@@ -431,7 +454,7 @@ mod tests {
             .unwrap();
         assert_eq!(integrity, "ok");
         eprintln!(
-            "100,000 games: import={import_time:?}; first page={page_time:?}; indexed search={search_time:?}; deep page={deep_time:?}"
+            "100,000 games: import={import_time:?}; first page={page_time:?}; indexed search={search_time:?}; deep page={deep_time:?}; jump miss={jump_time:?}"
         );
     }
     #[test]
@@ -458,6 +481,12 @@ mod tests {
         };
         let page = search(&db, &filter, i64::MAX).unwrap();
         assert_eq!(page.total, 1);
+        let names = |q| jump(&db, q).unwrap().into_iter().map(|r| r.white).collect::<Vec<_>>();
+        assert_eq!(names("arl nan"), ["Carlsen"]);
+        assert_eq!(names("ISCH"), ["Tal"]);
+        assert_eq!(names(""), ["Carlsen", "Tal"]);
+        assert!(names("Tal Anand").is_empty());
+        assert!(names("%").is_empty());
         let mut game = load(&db, page.rows[0].id).unwrap();
         game.notes.insert(1, "Excellent preparation".into());
         game.starred = true;
