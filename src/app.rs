@@ -1158,6 +1158,20 @@ impl App {
             painter.rect_stroke(bar, 0.0, egui::Stroke::new(1.0_f32, BEVEL), egui::StrokeKind::Outside);
             let legal = pos.legal_moves();
             let mut clicked = None;
+            let mut dragged = None;
+            // Atlas cell and lift; shorter pieces sit low in the atlas because the bases share a baseline.
+            let piece_uv = |piece: shakmaty::Piece| {
+                let (column, lift) = match piece.role {
+                    Role::King => (0, 0.0),
+                    Role::Queen => (1, 0.04),
+                    Role::Bishop => (2, 0.05),
+                    Role::Knight => (3, 0.05),
+                    Role::Rook => (4, 0.07),
+                    Role::Pawn => (5, 0.09),
+                };
+                let top = if piece.color == Color::White { 0.0 } else { 0.5 };
+                (egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5)), lift)
+            };
             for row in 0..8 { for col in 0..8 {
                 let file = if self.flipped { 7-col } else { col };
                 let rank = if self.flipped { row } else { 7-row };
@@ -1182,28 +1196,26 @@ impl App {
                 if destination { painter.circle_filled(square_rect.center(), cell * 0.12, Color32::from_black_alpha(75)); }
                 let piece = pos.board().piece_at(square);
                 let square_label = piece.map(|piece| format!("{square}: {:?} {:?}", piece.color, piece.role)).unwrap_or_else(|| format!("{square}: empty"));
-                let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click());
+                let response = ui.interact(square_rect, ui.id().with(("square", square)), egui::Sense::click_and_drag());
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !self.loading, &square_label));
+                let own_piece = piece.filter(|p| p.color == pos.turn() && !self.loading);
+                if response.drag_started() && own_piece.is_some() { self.selected_square = Some(square); }
+                if self.selected_square == Some(square) && own_piece.is_some() {
+                    if response.dragged() { dragged = own_piece; }
+                    // A drop is handled as a click on the square under the pointer.
+                    if response.drag_stopped() && let Some(p) = ctx.pointer_interact_pos() && squares.contains(p) {
+                        let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
+                        let (f, rk) = if self.flipped { (7 - c, r) } else { (c, 7 - r) };
+                        clicked = Some(Square::new((rk * 8 + f) as u32));
+                    }
+                }
                 if response.on_hover_text(square_label).clicked() { clicked = Some(square); }
                 // Coordinates stamped into the cover cloth.
                 let coordinate = Color32::from_rgb(214, 202, 176);
                 if col==0 { painter.text(min-Vec2::new(BIND/2.0+1.5,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),coordinate); }
                 if row==7 { painter.text(min+Vec2::new(cell/2.0,cell+BIND/2.0+1.5),egui::Align2::CENTER_CENTER,((b'a'+file as u8) as char).to_string(),egui::FontId::proportional(11.0),coordinate); }
-                if let Some(piece) = piece {
-                    // Shorter pieces sit low in the atlas because the bases share a baseline.
-                    let (column, lift) = match piece.role {
-                        Role::King => (0, 0.0),
-                        Role::Queen => (1, 0.04),
-                        Role::Bishop => (2, 0.05),
-                        Role::Knight => (3, 0.05),
-                        Role::Rook => (4, 0.07),
-                        Role::Pawn => (5, 0.09),
-                    };
-                    let top = if piece.color == Color::White { 0.0 } else { 0.5 };
-                    let uv = egui::Rect::from_min_max(
-                        egui::pos2(column as f32 / 6.0, top),
-                        egui::pos2((column + 1) as f32 / 6.0, top + 0.5),
-                    );
+                if let Some(piece) = piece && !(dragged.is_some() && self.selected_square == Some(square)) {
+                    let (uv, lift) = piece_uv(piece);
                     let piece_rect = square_rect.translate(Vec2::new(0.0, -cell * lift));
                     painter.image(self.piece_art.id(), piece_rect, uv, Color32::WHITE);
                 }
@@ -1231,6 +1243,11 @@ impl App {
                 let label = egui::Rect::from_center_size(start + (base - start) * 0.5, galley.size() + Vec2::new(8.0, 2.0));
                 painter.rect_filled(label, 4, Color32::from_rgba_unmultiplied(25, 70, 140, if top { 230 } else { 190 }));
                 painter.galley(label.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+            }
+            if let Some(piece) = dragged && let Some(p) = ctx.pointer_interact_pos() {
+                let (uv, lift) = piece_uv(piece);
+                painter.image(self.piece_art.id(), egui::Rect::from_center_size(p, Vec2::splat(cell)).translate(Vec2::new(0.0, -cell * lift)), uv, Color32::WHITE);
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             ui.add_space(8.0);
             let line = replay.line(self.current);
@@ -1260,7 +1277,7 @@ impl App {
                         .setBool_forKey(!self.sounds_enabled, ns_string!("MuteBoardSounds"));
                 }
             });
-            ui.small("Click a piece, then a highlighted square to explore a move.");
+            ui.small("Click or drag a piece to a highlighted square to explore a move.");
             ui.label(RichText::new(format!("Position: {}",Fen::from_position(pos,EnPassantMode::Legal))).size(10.0).color(MUTED));
             if let Some(square) = clicked && !self.loading {
                 if let Some(from) = self.selected_square {
