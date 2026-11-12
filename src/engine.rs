@@ -34,14 +34,12 @@ pub enum Event {
 pub struct Job {
     pub receive: mpsc::Receiver<Event>,
     cancel: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Drop for Job {
+    // No join: the worker sees the flag within ~50 ms and reaps Stockfish itself.
+    // Joining here blocked the UI thread and swallowed the piece-slide animation.
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -110,7 +108,7 @@ fn spawn(
     let (send, receive) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
-    let worker = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         work(&flag, &|event| {
             let _ = send.send(event);
             ctx.request_repaint();
@@ -119,7 +117,6 @@ fn spawn(
     Job {
         receive,
         cancel,
-        worker: Some(worker),
     }
 }
 
