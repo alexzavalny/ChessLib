@@ -55,6 +55,10 @@ pub struct App {
     placement_sound: Option<Retained<NSSound>>,
     capture_sound: Option<Retained<NSSound>>,
     selected_square: Option<Square>,
+    /// The node the board last showed and when it changed, so pieces glide from there.
+    slide: Option<(usize, Instant)>,
+    /// The next position change came from a drag, which already put the piece in place.
+    dropped: bool,
     promotion: Vec<Move>,
     board_position: Option<(i64, usize)>,
     engine_path: Option<PathBuf>,
@@ -190,6 +194,8 @@ impl App {
             placement_sound: BoardSound::Placement.load(),
             capture_sound: BoardSound::Capture.load(),
             selected_square: None,
+            slide: None,
+            dropped: false,
             promotion: vec![],
             board_position: None,
             engine_path: engine::discover(),
@@ -630,6 +636,11 @@ impl App {
             }
             self.selected_square = None;
             self.promotion.clear();
+            let dropped = std::mem::take(&mut self.dropped);
+            self.slide = match (key, self.board_position) {
+                (Some((game, _)), Some((previous_game, previous))) if game == previous_game && !dropped => Some((previous, Instant::now())),
+                _ => None,
+            };
             self.board_position = key;
         }
         if key != self.analysis_position {
@@ -1159,6 +1170,7 @@ impl App {
             let legal = pos.legal_moves();
             let mut clicked = None;
             let mut dragged = None;
+            let mut drop = false;
             // Atlas cell and lift; shorter pieces sit low in the atlas because the bases share a baseline.
             let piece_uv = |piece: shakmaty::Piece| {
                 let (column, lift) = match piece.role {
@@ -1172,6 +1184,33 @@ impl App {
                 let top = if piece.color == Color::White { 0.0 } else { 0.5 };
                 (egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5)), lift)
             };
+            let center = |s: Square| {
+                let (file, rank) = (s.file() as usize, s.rank() as usize);
+                let (col, row) = if self.flipped { (7 - file, rank) } else { (file, 7 - rank) };
+                origin + Vec2::new((col as f32 + 0.5) * cell, (row as f32 + 0.5) * cell)
+            };
+            let draw_piece = |piece: shakmaty::Piece, at: egui::Pos2| {
+                let (uv, lift) = piece_uv(piece);
+                painter.image(self.piece_art.id(), egui::Rect::from_center_size(at, Vec2::splat(cell)).translate(Vec2::new(0.0, -cell * lift)), uv, Color32::WHITE);
+            };
+            // Each piece that arrived on a square glides from the nearest square it left.
+            const SLIDE: f32 = 0.2;
+            let mut sliding = Vec::new();
+            let mut progress = 1.0;
+            if let Some((node, started)) = self.slide
+                && let Some(before) = replay.nodes.get(node).and_then(|n| n.position.as_ref())
+                && started.elapsed().as_secs_f32() < SLIDE
+            {
+                let t = started.elapsed().as_secs_f32() / SLIDE;
+                progress = 1.0 - (1.0 - t).powi(3);
+                let (old, new) = (before.board(), pos.board());
+                for (to, piece) in new.clone() {
+                    if old.piece_at(to) == Some(piece) { continue; }
+                    let from = old.clone().into_iter().filter(|&(s, p)| p == piece && new.piece_at(s) != Some(piece)).map(|(s, _)| s).min_by_key(|s| s.distance(to));
+                    if let Some(from) = from { sliding.push((piece, from, to, old.piece_at(to))); }
+                }
+                ctx.request_repaint();
+            }
             for row in 0..8 { for col in 0..8 {
                 let file = if self.flipped { 7-col } else { col };
                 let rank = if self.flipped { row } else { 7-row };
@@ -1207,6 +1246,7 @@ impl App {
                         let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
                         let (f, rk) = if self.flipped { (7 - c, r) } else { (c, 7 - r) };
                         clicked = Some(Square::new((rk * 8 + f) as u32));
+                        drop = true;
                     }
                 }
                 if response.on_hover_text(square_label).clicked() { clicked = Some(square); }
@@ -1214,19 +1254,19 @@ impl App {
                 let coordinate = Color32::from_rgb(214, 202, 176);
                 if col==0 { painter.text(min-Vec2::new(BIND/2.0+1.5,-cell/2.0),egui::Align2::CENTER_CENTER,(rank+1).to_string(),egui::FontId::proportional(11.0),coordinate); }
                 if row==7 { painter.text(min+Vec2::new(cell/2.0,cell+BIND/2.0+1.5),egui::Align2::CENTER_CENTER,((b'a'+file as u8) as char).to_string(),egui::FontId::proportional(11.0),coordinate); }
-                if let Some(piece) = piece && !(dragged.is_some() && self.selected_square == Some(square)) {
-                    let (uv, lift) = piece_uv(piece);
-                    let piece_rect = square_rect.translate(Vec2::new(0.0, -cell * lift));
-                    painter.image(self.piece_art.id(), piece_rect, uv, Color32::WHITE);
+                // A captured piece stays put until the capturer lands on it.
+                let arriving = sliding.iter().find(|s| s.2 == square);
+                let shown = match arriving { Some(s) => s.3, None => piece };
+                if let Some(piece) = shown && !(dragged.is_some() && self.selected_square == Some(square)) {
+                    draw_piece(piece, square_rect.center());
                 }
             }}
+            // Drawn after the squares so a gliding piece passes over the others.
+            for &(piece, from, to, _) in &sliding {
+                draw_piece(piece, center(from) + (center(to) - center(from)) * progress);
+            }
             // Engine lines as arrows over the pieces, weakest first so the best sits on top.
             // The legality check guards a stale evaluation.
-            let center = |s: Square| {
-                let (file, rank) = (s.file() as usize, s.rank() as usize);
-                let (col, row) = if self.flipped { (7 - file, rank) } else { (file, 7 - rank) };
-                origin + Vec2::new((col as f32 + 0.5) * cell, (row as f32 + 0.5) * cell)
-            };
             for line in self.lines.iter().rev() {
                 let Some(best) = line.best.filter(|m| legal.contains(m)) else { continue };
                 let Some(from) = best.from() else { continue };
@@ -1245,8 +1285,7 @@ impl App {
                 painter.galley(label.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
             }
             if let Some(piece) = dragged && let Some(p) = ctx.pointer_interact_pos() {
-                let (uv, lift) = piece_uv(piece);
-                painter.image(self.piece_art.id(), egui::Rect::from_center_size(p, Vec2::splat(cell)).translate(Vec2::new(0.0, -cell * lift)), uv, Color32::WHITE);
+                draw_piece(piece, p);
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             ui.add_space(8.0);
@@ -1282,7 +1321,7 @@ impl App {
             if let Some(square) = clicked && !self.loading {
                 if let Some(from) = self.selected_square {
                     let candidates: Vec<_> = legal.iter().copied().filter(|m| m.from() == Some(from) && move_destination(*m) == square).collect();
-                    if candidates.len() == 1 { self.play(candidates[0]); }
+                    if candidates.len() == 1 { self.dropped = drop; self.play(candidates[0]); }
                     else if candidates.len() > 1 { self.promotion = candidates; }
                     else { self.selected_square = (square != from && pos.board().piece_at(square).is_some_and(|p| p.color == pos.turn())).then_some(square); }
                 } else {
