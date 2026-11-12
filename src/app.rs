@@ -63,6 +63,8 @@ pub struct App {
     train_player: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
+    /// The Events list while it replaces the games list: its name filter and every event.
+    event_list: Option<(String, Vec<library::EventRow>)>,
     /// The last game id before the running import, so new games can be checked afterwards.
     import_floor: i64,
     /// Imported games still missing details, and the one being filled in (White, Black, Event, Date; true when opened by Edit…).
@@ -85,6 +87,7 @@ pub struct App {
     replay: Option<Replay>,
     current: usize,
     scrolled_node: Option<usize>,
+    header_icon: egui::TextureHandle,
     piece_art: egui::TextureHandle,
     bookcloth: egui::TextureHandle,
     flipped: bool,
@@ -179,6 +182,20 @@ impl App {
                 .push("symbols".into());
         }
         ctx.set_fonts(fonts);
+        let icon = image::load_from_memory_with_format(
+            include_bytes!("../assets/header-icon.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("embedded header icon must be a valid PNG")
+        .into_rgba8();
+        let header_icon = ctx.load_texture(
+            "ChessLib header icon",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width() as usize, icon.height() as usize],
+                icon.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
         let piece_art = image::load_from_memory_with_format(
             include_bytes!("../assets/stone-pieces.png"),
             image::ImageFormat::Png,
@@ -213,6 +230,7 @@ impl App {
             train_setup: false,
             train_player: String::new(),
             jump: None,
+            event_list: None,
             import_floor: 0,
             missing: Vec::new(),
             details: None,
@@ -233,6 +251,7 @@ impl App {
             replay: None,
             current: 0,
             scrolled_node: None,
+            header_icon,
             piece_art,
             bookcloth,
             flipped: false,
@@ -527,19 +546,32 @@ impl App {
                     self.search_due = Some(Instant::now());
                 }
                 ui.horizontal(|ui| {
+                    let listing = self.event_list.is_some();
                     if ui
-                        .selectable_label(!self.filter.starred, "All games")
+                        .selectable_label(!self.filter.starred && !listing, "All games")
                         .clicked()
                     {
                         self.filter.starred = false;
+                        self.event_list = None;
                         self.refresh(true);
                     }
                     if ui
-                        .selectable_label(self.filter.starred, "★ Favourites")
+                        .selectable_label(self.filter.starred && !listing, "★ Favourites")
                         .clicked()
                     {
                         self.filter.starred = true;
+                        self.event_list = None;
                         self.refresh(true);
+                    }
+                    if ui.selectable_label(listing, "Events").clicked() {
+                        self.event_list = match library::events(&self.db) {
+                            Ok(events) if !listing => Some((String::new(), events)),
+                            Ok(_) => None,
+                            Err(e) => {
+                                self.error = Some(format!("Could not list events: {e}"));
+                                None
+                            }
+                        };
                     }
                 });
                 let sources = self
@@ -573,10 +605,57 @@ impl App {
                                 .changed();
                         }
                     });
+                if let Some(event) = self.filter.event.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Event: {}", event_name(&event))).color(GREEN));
+                        if ui.small_button("✕").on_hover_text("Show games from every event").clicked() {
+                            self.filter.event = None;
+                            changed = true;
+                        }
+                    });
+                }
                 if changed {
                     self.refresh(true);
                 }
                 ui.separator();
+                if let Some((query, events)) = &mut self.event_list {
+                    ui.add(
+                        egui::TextEdit::singleline(query)
+                            .hint_text("Filter events…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let needle = query.to_lowercase();
+                    let shown: Vec<_> = events
+                        .iter()
+                        .filter(|e| e.name.to_lowercase().contains(&needle))
+                        .collect();
+                    ui.small(format!("{} events", shown.len()));
+                    let mut chosen = None;
+                    egui::ScrollArea::vertical().id_salt("events").show_rows(ui, 44.0, shown.len(), |ui, range| {
+                        for event in &shown[range] {
+                            let dates = match (&event.first, &event.last) {
+                                (Some(first), Some(last)) if first != last => format!("{first} – {last}"),
+                                (Some(date), _) => date.clone(),
+                                _ => "Date unknown".into(),
+                            };
+                            let games = if event.games == 1 { "1 game".into() } else { format!("{} games", event.games) };
+                            let text = format!("{}\n{dates} · {games}", event_name(&event.name));
+                            let selected = self.filter.event.as_ref() == Some(&event.name);
+                            if ui
+                                .add_sized([ui.available_width(), 44.0], egui::Button::new(RichText::new(text).size(13.0)).wrap().selected(selected).frame(selected))
+                                .clicked()
+                            {
+                                chosen = Some(event.name.clone());
+                            }
+                        }
+                    });
+                    if let Some(name) = chosen {
+                        self.filter.event = Some(name);
+                        self.event_list = None;
+                        self.refresh(true);
+                    }
+                    return;
+                }
                 let (rows, total, more) = self
                     .page
                     .as_ref()
@@ -1895,7 +1974,8 @@ impl eframe::App for App {
                 w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 120, 96));
                 w.noninteractive.fg_stroke.color = Color32::from_rgb(140, 160, 140);
                 ui.horizontal(|ui| {
-                    embossed(ui, "♞  CHESSLIB", 19.0, IVORY);
+                    ui.image((self.header_icon.id(), Vec2::splat(36.0)));
+                    embossed(ui, "CHESSLIB", 19.0, IVORY);
                     ui.label(
                         RichText::new(" /  A personal chess library")
                             .size(12.0)
@@ -2462,4 +2542,9 @@ mod tests {
             Square::C8
         );
     }
+}
+
+/// An event's display name; PGN leaves unknown events blank or "?".
+fn event_name(name: &str) -> &str {
+    if name.trim_matches([' ', '?']).is_empty() { "(No event)" } else { name }
 }

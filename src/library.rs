@@ -27,6 +27,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
         CREATE INDEX IF NOT EXISTS games_source_id ON games(source, id);
         CREATE INDEX IF NOT EXISTS games_starred_id ON games(starred, id);
+        CREATE INDEX IF NOT EXISTS games_event_date ON games(event, date);
         CREATE VIRTUAL TABLE IF NOT EXISTS games_fts USING fts5(search_text, content='games', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
         CREATE TRIGGER IF NOT EXISTS games_ai AFTER INSERT ON games BEGIN
           INSERT INTO games_fts(rowid,search_text) VALUES(new.id,new.search_text); END;
@@ -42,6 +43,8 @@ pub struct Filter {
     pub query: String,
     pub source: String,
     pub starred: bool,
+    /// Only games of this event (exact name); None for any.
+    pub event: Option<String>,
 }
 impl Filter {
     fn fts(&self) -> String {
@@ -54,7 +57,7 @@ impl Filter {
     }
     fn clause(&self) -> String {
         format!(
-            "WHERE (?1 = '' OR source = ?1) AND (?2 = 0 OR starred = 1) {}",
+            "WHERE (?1 = '' OR source = ?1) AND (?2 = 0 OR starred = 1) AND (?4 IS NULL OR event = ?4) {}",
             if self.fts().is_empty() {
                 "AND ?3 = ''"
             } else {
@@ -124,17 +127,18 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
     let fts = filter.fts();
     let total = db.query_row(
         &format!("SELECT count(*) FROM games {clause}"),
-        params![filter.source, filter.starred, fts],
+        params![filter.source, filter.starred, fts, filter.event],
         |r| r.get(0),
     )?;
     let all = db.query_row("SELECT count(*) FROM games", [], |r| r.get(0))?;
-    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?4 ORDER BY id DESC LIMIT ?5"))?;
+    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?5 ORDER BY id DESC LIMIT ?6"))?;
     let mut rows = stmt
         .query_map(
             params![
                 filter.source,
                 filter.starred,
                 fts,
+                filter.event,
                 before,
                 PAGE_SIZE as i64 + 1
             ],
@@ -168,6 +172,23 @@ pub fn load(db: &Connection, id: i64) -> Result<Loaded> {
         notes: serde_json::from_str(&notes)?,
         starred,
     })
+}
+/// An event with its game count and first/last known dates (None when every date is unknown).
+#[derive(Clone)]
+pub struct EventRow {
+    pub name: String,
+    pub games: i64,
+    pub first: Option<String>,
+    pub last: Option<String>,
+}
+/// Every event, most recent first; events without a known date go last.
+pub fn events(db: &Connection) -> Result<Vec<EventRow>> {
+    Ok(db
+        .prepare("SELECT event, count(*), min(CASE WHEN date GLOB '[0-9]*' THEN date END) AS first,
+            max(CASE WHEN date GLOB '[0-9]*' THEN date END) AS last
+            FROM games GROUP BY event ORDER BY last IS NULL, last DESC, event")?
+        .query_map([], |r| Ok(EventRow { name: r.get(0)?, games: r.get(1)?, first: r.get(2)?, last: r.get(3)? }))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 /// Games added after `after` with no White, Black, Event or year ("?", "????.??.??" or blank).
 pub fn missing_details(db: &Connection, after: i64) -> Result<Vec<i64>> {
@@ -330,10 +351,10 @@ pub fn export(db: &Connection, filter: &Filter, id: Option<i64>, path: &Path) ->
     let result = (|| -> Result<u64> {
         let mut out = BufWriter::new(file);
         let mut stmt = db.prepare(&format!(
-            "SELECT body,notes FROM games {} AND (?4 IS NULL OR id=?4) ORDER BY id",
+            "SELECT body,notes FROM games {} AND (?5 IS NULL OR id=?5) ORDER BY id",
             filter.clause()
         ))?;
-        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), id])?;
+        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, id])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
             let game: Game = serde_json::from_str(&row.get::<_, String>(0)?)?;
@@ -534,6 +555,11 @@ mod tests {
         };
         let page = search(&db, &filter, i64::MAX).unwrap();
         assert_eq!(page.total, 1);
+        let events = events(&db).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[1].name.as_str(), events[1].games, events[1].last.as_deref()), ("Candidates", 1, None));
+        let candidates = Filter { event: Some("Candidates".into()), ..Default::default() };
+        assert_eq!(search(&db, &candidates, i64::MAX).unwrap().rows[0].white, "Tal");
         let missing = missing_details(&db, 0).unwrap();
         assert_eq!(missing.len(), 2, "neither fixture game has a date");
         assert!(missing_details(&db, last_id(&db).unwrap()).unwrap().is_empty());
