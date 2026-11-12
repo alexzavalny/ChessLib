@@ -607,11 +607,12 @@ impl App {
                     });
                 if let Some(event) = self.filter.event.clone() {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Event: {}", event_name(&event))).color(GREEN));
+                        // Button first so the label truncates into the remaining width instead of widening the panel.
                         if ui.small_button("✕").on_hover_text("Show games from every event").clicked() {
                             self.filter.event = None;
                             changed = true;
                         }
+                        ui.add(egui::Label::new(RichText::new(format!("Event: {}", event_name(&event))).color(GREEN)).truncate());
                     });
                 }
                 if changed {
