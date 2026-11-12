@@ -67,6 +67,8 @@ pub struct App {
     /// Engine lines for the current position, sorted by MultiPV rank.
     lines: Vec<engine::Evaluation>,
     engine_lines: usize,
+    /// Height of the move list, set by dragging the rule below it.
+    moves_height: f32,
     analysis_error: Option<String>,
     continuous: bool,
     review_job: Option<engine::Job>,
@@ -205,6 +207,10 @@ impl App {
             engine_lines: match NSUserDefaults::standardUserDefaults().integerForKey(ns_string!("EngineLines")) {
                 n if n < 1 => 3,
                 n => (n as usize).min(5),
+            },
+            moves_height: match NSUserDefaults::standardUserDefaults().doubleForKey(ns_string!("MovesHeight")) {
+                h if h < 80.0 => 260.0,
+                h => h as f32,
             },
             analysis_error: None,
             continuous: false,
@@ -698,8 +704,7 @@ impl App {
                 Err(e) => self.review_error = Some(e.to_string()),
             }
         }
-        ui.separator();
-        ui.label(RichText::new("Stockfish analysis").strong());
+        section(ui, "Stockfish", &self.lines.first().map(|e| format!("Depth {}", e.depth)).unwrap_or_default());
         let position = self
             .replay
             .as_ref()
@@ -707,32 +712,47 @@ impl App {
         let terminal = position.as_ref().is_some_and(|p| p.outcome().is_known());
         let available =
             position.is_some() && !terminal && !self.loading && self.engine_path.is_some();
-        if ui
-            .add_enabled(
-                self.engine_path.is_some(),
-                egui::Checkbox::new(&mut self.continuous, "Continuous analysis"),
-            )
-            .changed()
-        {
-            self.analysis = None;
-            self.analysis_error = None;
-        }
-        if ui
-            .add(egui::Slider::new(&mut self.engine_lines, 1..=5).text("Lines"))
-            .on_hover_text("How many candidate moves Stockfish calculates and shows as arrows")
-            .changed()
-        {
-            NSUserDefaults::standardUserDefaults()
-                .setInteger_forKey(self.engine_lines as _, ns_string!("EngineLines"));
-            self.analysis = None;
-            self.lines.clear();
-        }
-        ui.horizontal_wrapped(|ui| {
+        // Row as tall as a button, so the checkbox centres against the dropdown.
+        let row = Vec2::new(ui.available_width(), ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y);
+        ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(
+                    self.engine_path.is_some(),
+                    egui::Checkbox::new(&mut self.continuous, "Continuous"),
+                )
+                .on_hover_text("Continuous analysis (L)")
+                .changed()
+            {
+                self.analysis = None;
+                self.analysis_error = None;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let before = self.engine_lines;
+                egui::ComboBox::from_id_salt("engine-lines")
+                    .width(76.0)
+                    .selected_text(format!("{} {}", self.engine_lines, if self.engine_lines == 1 { "line" } else { "lines" }))
+                    .show_ui(ui, |ui| {
+                        for n in 1..=5 {
+                            ui.selectable_value(&mut self.engine_lines, n, n.to_string());
+                        }
+                    })
+                    .response
+                    .on_hover_text("How many candidate moves Stockfish calculates and shows as arrows");
+                if self.engine_lines != before {
+                    NSUserDefaults::standardUserDefaults()
+                        .setInteger_forKey(self.engine_lines as _, ns_string!("EngineLines"));
+                    self.analysis = None;
+                    self.lines.clear();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     available && self.review_job.is_none(),
-                    egui::Button::new("Analyze once · 3 seconds"),
+                    egui::Button::new("Analyze 3 s"),
                 )
+                .on_hover_text("Analyze this position once for three seconds")
                 .clicked()
             {
                 self.continuous = false;
@@ -747,12 +767,21 @@ impl App {
                     ctx.clone(),
                 ));
             }
+            if let Some(best) = self.lines.first().and_then(|e| e.best)
+                && ui
+                    .add_enabled(!self.loading, egui::Button::new("Play best"))
+                    .clicked()
+            {
+                self.play(best);
+            }
             if self.analysis.is_some() {
-                ui.spinner();
-                if ui.button("Stop").clicked() {
-                    self.continuous = false;
-                    self.analysis = None;
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Stop").clicked() {
+                        self.continuous = false;
+                        self.analysis = None;
+                    }
+                    ui.spinner();
+                });
             }
         });
         if self.continuous && available && self.analysis.is_none() && self.review_job.is_none() {
@@ -770,30 +799,24 @@ impl App {
         if terminal {
             ui.small("Game over in this position.");
         }
-        if let Some(e) = self.lines.first().cloned() {
-            ui.label(RichText::new(format!("{}  ·  Depth {}", e.score, e.depth)).strong());
-            ui.small("Positive favours White; negative favours Black.");
-            for line in &self.lines {
-                ui.label(format!("{}. {}  {}", line.multipv, line.score, line.line));
-            }
-            if let Some(best) = e.best {
-                if ui
-                    .add_enabled(!self.loading, egui::Button::new("Play best move"))
-                    .clicked()
-                {
-                    self.play(best);
+        if !self.lines.is_empty() {
+            egui::Grid::new("engine-lines").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                for line in &self.lines {
+                    ui.label(RichText::new(&line.score).strong())
+                        .on_hover_text("Positive favours White; negative favours Black.");
+                    ui.add(egui::Label::new(&line.line).truncate());
+                    ui.end_row();
                 }
-            }
+            });
         }
         if let Some(error) = &self.analysis_error {
             ui.colored_label(Color32::DARK_RED, error);
         }
-        self.review_panel(ui, ctx);
         if self.engine_path.is_none() {
             ui.label("Choose a local Stockfish executable to enable offline analysis.");
             ui.hyperlink_to("Get Stockfish", "https://stockfishchess.org/download/");
         }
-        ui.collapsing("Engine", |ui| {
+        ui.collapsing("Engine settings", |ui| {
             if let Some(path) = &self.engine_path {
                 ui.small(path.display().to_string());
             }
@@ -814,8 +837,7 @@ impl App {
     }
 
     fn review_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.separator();
-        ui.label(RichText::new("Whole-game review").strong());
+        section(ui, "Game review", "Main line · 0.5 s per move");
         if self.review_job.is_some() {
             let (done, total) = self.review_progress;
             ui.add(
@@ -851,7 +873,6 @@ impl App {
                 Err(e) => self.review_error = Some(e.to_string()),
             }
         }
-        ui.small("Original main line · 0.5 seconds per position");
         if let Some(error) = &self.review_error {
             ui.colored_label(Color32::DARK_RED, error);
         }
@@ -859,18 +880,25 @@ impl App {
             if self.review_job.is_some() {
                 ui.small("Previous completed report");
             }
-            egui::Grid::new("review-summary").striped(true).show(ui, |ui| {
-                ui.label(""); ui.strong("White"); ui.strong("Black"); ui.end_row();
-                ui.label("Approx. accuracy").on_hover_text("Average move accuracy estimated from loss of winning chances. Analysis time affects the result; this is not a Chess.com or Lichess game score.");
-                for white in [true, false] { ui.label(report.accuracy(white).map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into())); }
+            let right = |ui: &mut egui::Ui, text: RichText| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(text));
+            };
+            // Three equal columns fill the panel width.
+            let column = ((ui.available_width() - 16.0) / 3.0).floor();
+            egui::Grid::new("review-summary").striped(true).min_col_width(column).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("");
+                right(ui, RichText::new("White").strong());
+                right(ui, RichText::new("Black").strong());
+                ui.end_row();
+                ui.label("Accuracy").on_hover_text("Approximate average move accuracy, estimated from loss of winning chances. Analysis time affects the result and deeper analysis may change the verdict; this is not a Chess.com or Lichess game score.");
+                for white in [true, false] { right(ui, RichText::new(report.accuracy(white).map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into())).strong()); }
                 ui.end_row();
                 for quality in [engine::Quality::Best, engine::Quality::Good, engine::Quality::Inaccuracy, engine::Quality::Mistake, engine::Quality::Blunder] {
                     ui.label(quality.label());
-                    for white in [true, false] { ui.label(report.count(white, quality).to_string()); }
+                    for white in [true, false] { right(ui, RichText::new(report.count(white, quality).to_string())); }
                     ui.end_row();
                 }
             });
-            ui.small("Estimated from win-chance loss; deeper analysis may change the verdict.");
             ui.collapsing("Moves & mistakes", |ui| {
                 if let Some(replay) = &self.replay {
                     for movement in &report.moves {
@@ -924,7 +952,8 @@ impl App {
                             let line = replay.line(self.current);
                             egui::ScrollArea::vertical()
                                 .id_salt("moves")
-                                .max_height(160.0)
+                                .max_height(self.moves_height)
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     let start =
                                         ui.selectable_label(self.current == 0, "Starting position");
@@ -934,28 +963,45 @@ impl App {
                                     if self.current == 0 && self.scrolled_node != Some(0) {
                                         start.scroll_to_me(Some(egui::Align::Center));
                                     }
-                                    ui.horizontal_wrapped(|ui| {
-                                        for &id in line.iter().skip(1) {
-                                            let marker = if self.loaded.as_ref().is_some_and(|l| {
-                                                l.notes.get(&id).is_some_and(|n| !n.is_empty())
-                                            }) {
-                                                " •"
-                                            } else {
-                                                ""
-                                            };
-                                            let response = ui.selectable_label(
-                                                self.current == id,
-                                                format!("{}{marker}", replay.label(id)),
-                                            );
-                                            if self.current == id && self.scrolled_node != Some(id)
-                                            {
-                                                response.scroll_to_me(Some(egui::Align::Center));
+                                    // Scoresheet: move number, then White and Black in fixed columns.
+                                    let cell = Vec2::new(((ui.available_width() - 44.0) / 2.0).floor(), 0.0);
+                                    egui::Grid::new("scoresheet")
+                                        .num_columns(3)
+                                        .striped(true)
+                                        .spacing([4.0, 2.0])
+                                        .show(ui, |ui| {
+                                            let mut open = false;
+                                            for &id in line.iter().skip(1) {
+                                                let half = replay.half_move(id);
+                                                if !open {
+                                                    ui.label(RichText::new(format!("{}.", half / 2 + 1)).color(MUTED));
+                                                    if half % 2 == 1 {
+                                                        ui.label("");
+                                                    }
+                                                }
+                                                let noted = self.loaded.as_ref().is_some_and(|l| {
+                                                    l.notes.get(&id).is_some_and(|n| !n.is_empty())
+                                                });
+                                                let response = ui.add(
+                                                    egui::Button::selectable(self.current == id, replay.nodes[id].san.as_str())
+                                                        .min_size(cell)
+                                                        .right_text(RichText::new(if noted { "•" } else { "" }).color(RIBBON)),
+                                                );
+                                                if self.current == id && self.scrolled_node != Some(id) {
+                                                    response.scroll_to_me(Some(egui::Align::Center));
+                                                }
+                                                if response.clicked() {
+                                                    next = id;
+                                                }
+                                                open = half % 2 == 0;
+                                                if !open {
+                                                    ui.end_row();
+                                                }
                                             }
-                                            if response.clicked() {
-                                                next = id;
+                                            if open {
+                                                ui.end_row();
                                             }
-                                        }
-                                    });
+                                        });
                                 });
                             let node = &replay.nodes[self.current];
                             if let Some(parent) = node.parent
@@ -993,8 +1039,8 @@ impl App {
                                     }
                                 });
                             }
-                            if ui.small_button("Return to main line").clicked() {
-                                let main = replay.line(0);
+                            let main = replay.line(0);
+                            if !main.contains(&self.current) && ui.button("Return to main line").clicked() {
                                 next = main[node.ply.min(main.len() - 1)];
                             }
                             self.scrolled_node = Some(self.current);
@@ -1003,14 +1049,28 @@ impl App {
                                 ui.colored_label(Color32::from_rgb(163, 91, 36), warning);
                             }
                         }
-                        ui.separator();
                         let title = self
                             .replay
                             .as_ref()
                             .filter(|_| self.current > 0)
                             .map(|r| format!("Notes after {}", r.label(self.current)))
                             .unwrap_or_else(|| "Game notes".into());
-                        ui.label(RichText::new(title).strong());
+                        // The rule between moves and notes is a drag handle for the move list height.
+                        ui.add_space(6.0);
+                        let (rule, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), egui::Sense::drag());
+                        let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                        if drag.dragged() {
+                            self.moves_height = (self.moves_height + drag.drag_delta().y).clamp(80.0, 900.0);
+                        }
+                        if drag.drag_stopped() {
+                            NSUserDefaults::standardUserDefaults()
+                                .setDouble_forKey(self.moves_height as _, ns_string!("MovesHeight"));
+                        }
+                        let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
+                        ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
+                        ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
+                        // Notes autosave shortly after typing; ⌘S saves immediately.
+                        header(ui, title, if self.dirty { "Unsaved" } else { "Saved" });
                         if let Some(loaded) = &mut self.loaded {
                             let note = loaded.notes.entry(self.current).or_default();
                             let sheet = ui.painter().add(egui::Shape::Noop);
@@ -1044,16 +1104,6 @@ impl App {
                                 self.edited = Instant::now();
                             }
                         }
-                        ui.horizontal(|ui| {
-                            ui.small(if self.dirty {
-                                "Unsaved changes"
-                            } else {
-                                "Saved locally"
-                            });
-                            if ui.button("Save").clicked() {
-                                self.save();
-                            }
-                        });
                         if let Some(replay) = &self.replay {
                             for annotation in &replay.nodes[self.current].annotations {
                                 if let crate::pgn::Token::Comment(text) = annotation {
@@ -1062,6 +1112,9 @@ impl App {
                             }
                         }
                         self.engine_panel(ui, ctx);
+                        self.review_panel(ui, ctx);
+                        ui.add_space(6.0);
+                        ui.separator();
                         ui.collapsing("Game details & PGN", |ui| {
                             if let Some(loaded) = &self.loaded {
                                 for (key, value) in &loaded.game.tags {
@@ -1303,7 +1356,7 @@ impl App {
                 ui.label(format!("{move_number} / {line_length}"));
                 if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
                 if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
-                if ui.button("Flip").clicked() { self.flipped = !self.flipped; }
+                if ui.button("Flip").on_hover_text("Flip the board (F)").clicked() { self.flipped = !self.flipped; }
             });
             ui.horizontal(|ui| {
                 ui.small(turn);
@@ -1365,6 +1418,17 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
+        let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
+        if !ctx.wants_keyboard_input() {
+            if plain(egui::Key::F) {
+                self.flipped = !self.flipped;
+            }
+            if plain(egui::Key::L) && self.engine_path.is_some() {
+                self.continuous = !self.continuous;
+                self.analysis = None;
+                self.analysis_error = None;
+            }
+        }
         if !ctx.wants_keyboard_input()
             && let Some(replay) = &self.replay
         {
@@ -1374,10 +1438,10 @@ impl eframe::App for App {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 self.current = replay.nodes[self.current].parent.unwrap_or(0);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::ArrowUp)) {
                 self.current = 0;
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::End) || i.key_pressed(egui::Key::ArrowDown)) {
                 self.current = *replay.line(self.current).last().unwrap();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1603,6 +1667,22 @@ fn material(painter: &egui::Painter, cloth: &egui::TextureHandle, rect: egui::Re
 }
 
 /// Soft shadow falling inward from the top edge, as under a book cover or a lifted page.
+/// A study-desk section: rule, bold title, and quiet status on the right.
+fn section(ui: &mut egui::Ui, title: impl Into<String>, meta: &str) {
+    ui.add_space(6.0);
+    ui.separator();
+    header(ui, title, meta);
+}
+
+fn header(ui: &mut egui::Ui, title: impl Into<String>, meta: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(meta).size(12.0).color(MUTED));
+        });
+    });
+}
+
 fn top_shadow(painter: &egui::Painter, rect: egui::Rect, depth: u8) {
     for i in 0..depth {
         let y = rect.top() + i as f32 + 0.5;

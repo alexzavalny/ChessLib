@@ -331,12 +331,17 @@ impl Replay {
         line
     }
 
-    pub fn label(&self, id: usize) -> String {
+    /// Half-moves since move 1, so even is a White move and odd a Black move.
+    pub fn half_move(&self, id: usize) -> usize {
         let initial = self.nodes[0].position.as_ref().unwrap();
-        let absolute = (initial.fullmoves().get() as usize - 1) * 2
+        (initial.fullmoves().get() as usize - 1) * 2
             + usize::from(initial.turn().is_black())
             + self.nodes[id].ply
-            - 1;
+            - 1
+    }
+
+    pub fn label(&self, id: usize) -> String {
+        let absolute = self.half_move(id);
         format!(
             "{}{} {}",
             absolute / 2 + 1,
