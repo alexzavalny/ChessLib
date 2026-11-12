@@ -110,7 +110,7 @@ pub fn jump(db: &Connection, query: &str) -> Result<Vec<Row>> {
         .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
         .collect();
     let sql = format!(
-        "SELECT id, white, black, event, date, result, eco, starred FROM games WHERE 1 {} ORDER BY id DESC LIMIT 20",
+        "SELECT id, white, black, event, date, result, eco, starred FROM games WHERE 1 {} ORDER BY id DESC LIMIT 10",
         " AND (white || ' ' || black) LIKE ? ESCAPE '\\'".repeat(words.len())
     );
     Ok(db

@@ -1889,21 +1889,20 @@ impl eframe::App for App {
                 if rows.is_empty() {
                     ui.label("No matching games.");
                 }
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    for (i, row) in rows.iter().enumerate() {
-                        let text = format!("{}  —  {}\n{} · {}", row.white, row.black, row.event, row.date);
-                        let response = ui.add_sized(
-                            [ui.available_width(), 44.0],
-                            egui::Button::new(text).selected(i == *highlight).frame(i == *highlight),
-                        );
-                        if i == *highlight && (up || down) {
-                            response.scroll_to_me(None);
-                        }
-                        if response.clicked() {
-                            open = Some(row.id);
-                        }
+                for (i, row) in rows.iter().enumerate() {
+                    let response = ui
+                        .add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::Button::new(format!("{}  —  {}   · {}", row.white, row.black, row.date))
+                                .truncate()
+                                .selected(i == *highlight)
+                                .frame(i == *highlight),
+                        )
+                        .on_hover_text(&row.event);
+                    if response.clicked() {
+                        open = Some(row.id);
                     }
-                });
+                }
                 close = ui.input(|i| i.key_pressed(egui::Key::Escape));
             });
             if let Some(id) = open {
