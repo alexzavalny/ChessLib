@@ -60,6 +60,8 @@ pub struct App {
     play_setup: Option<PlaySettings>,
     /// The "Train on mistakes" player field while its dialog is open; the name is kept for next time.
     train_setup: bool,
+    /// The game awaiting delete confirmation: id and "White — Black".
+    delete_game: Option<(i64, String)>,
     train_player: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
@@ -228,6 +230,7 @@ impl App {
             play: None,
             play_setup: None,
             train_setup: false,
+            delete_game: None,
             train_player: String::new(),
             jump: None,
             event_list: None,
@@ -357,6 +360,22 @@ impl App {
             self.loading = false;
             self.error = Some("The library worker stopped.".into());
         }
+    }
+    fn delete(&mut self, id: i64) {
+        if let Err(e) = library::delete(&self.db, id) {
+            self.error = Some(format!("Could not delete game: {e}"));
+            return;
+        }
+        // Close the game if it is open so nothing saves edits to a deleted row.
+        if self.loaded.as_ref().is_some_and(|g| g.id == id) {
+            self.loaded = None;
+            self.replay = None;
+            self.current = 0;
+            self.dirty = false;
+        }
+        self.missing.retain(|&m| m != id);
+        self.status = "Game deleted".into();
+        self.refresh(false);
     }
     fn edit_details(&mut self, id: i64, editing: bool) {
         // Flush pending notes first: the dialog saves its own copy of the game from the database.
@@ -695,6 +714,16 @@ impl App {
                                 }
                                 if ui.button("Train on this game").clicked() {
                                     self.start_training(Some(row.id));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .add_enabled(self.play.is_none(), egui::Button::new("Delete…"))
+                                    .on_disabled_hover_text("Finish the game or training first.")
+                                    .clicked()
+                                {
+                                    let name = |s: &str| if s.is_empty() { "?".to_owned() } else { s.to_owned() };
+                                    self.delete_game = Some((row.id, format!("{}  —  {}", name(&row.white), name(&row.black))));
                                     ui.close();
                                 }
                             });
@@ -2122,6 +2151,28 @@ impl eframe::App for App {
                 self.start_training(None);
             } else if cancel {
                 self.train_setup = false;
+            }
+        }
+        if let Some((id, title)) = &self.delete_game {
+            let (id, mut delete, mut cancel) = (*id, false, false);
+            let modal = egui::Modal::new(egui::Id::new("delete")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Delete game?");
+                ui.label(RichText::new(title).strong());
+                ui.label("Its notes and analysis are deleted too. This cannot be undone.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    delete = ui
+                        .add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT)))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if delete {
+                self.delete(id);
+            }
+            if delete || cancel || modal.should_close() {
+                self.delete_game = None;
             }
         }
         if let Some((query, rows, highlight)) = &mut self.jump {

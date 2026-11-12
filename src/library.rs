@@ -34,6 +34,8 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE TRIGGER IF NOT EXISTS games_au AFTER UPDATE OF search_text ON games BEGIN
           INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text);
           INSERT INTO games_fts(rowid,search_text) VALUES(new.id,new.search_text); END;
+        CREATE TRIGGER IF NOT EXISTS games_ad AFTER DELETE ON games BEGIN
+          INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text); END;
         PRAGMA user_version=1;")?;
     Ok(db)
 }
@@ -172,6 +174,11 @@ pub fn load(db: &Connection, id: i64) -> Result<Loaded> {
         notes: serde_json::from_str(&notes)?,
         starred,
     })
+}
+/// Removes a game with its notes and analysis; the search index follows via the games_ad trigger.
+pub fn delete(db: &Connection, id: i64) -> Result<()> {
+    db.execute("DELETE FROM games WHERE id=?", [id])?;
+    Ok(())
 }
 /// An event with its game count and first/last known dates (None when every date is unknown).
 #[derive(Clone)]
@@ -445,6 +452,19 @@ pub fn start_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delete_removes_game_from_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir.path().join("db")).unwrap();
+        let pgn = dir.path().join("input.pgn");
+        std::fs::write(&pgn, "[White \"Tal\"]\n[Black \"Fischer\"]\n\n1. e4 *\n\n[White \"Carlsen\"]\n[Black \"Anand\"]\n\n1. d4 *").unwrap();
+        import(&mut db, &[pgn], &AtomicBool::new(false), |_| {}).unwrap();
+        let tal = Filter { query: "Tal".into(), ..Default::default() };
+        delete(&db, search(&db, &tal, i64::MAX).unwrap().rows[0].id).unwrap();
+        assert_eq!(search(&db, &tal, i64::MAX).unwrap().total, 0);
+        assert_eq!(search(&db, &Filter::default(), i64::MAX).unwrap().all, 1);
+        db.execute("INSERT INTO games_fts(games_fts) VALUES('integrity-check')", []).unwrap();
+    }
     #[test]
     fn failed_export_preserves_existing_destination() {
         let dir = tempfile::tempdir().unwrap();
