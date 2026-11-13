@@ -1367,8 +1367,18 @@ impl App {
                                                 let noted = self.loaded.as_ref().is_some_and(|l| {
                                                     l.notes.get(&id).is_some_and(|n| !n.is_empty())
                                                 });
-                                                let glyphs = self.loaded.as_ref().map(|l| &l.game.glyphs);
-                                                let glyph = glyphs.and_then(|g| replay.glyph(g, id)).and_then(glyph_style);
+                                                // Your mark, else the PGN's, else the game review's verdict, as on Lichess; a removed mark hides all.
+                                                let glyph = self.loaded.as_ref().and_then(|l| {
+                                                    replay.glyph(&l.game.glyphs, id).or_else(|| {
+                                                        let review = l.game.review.as_ref().filter(|_| !l.game.glyphs.contains_key(&id))?;
+                                                        match review.moves.iter().find(|m| m.node == id)?.quality {
+                                                            engine::Quality::Inaccuracy => Some(6),
+                                                            engine::Quality::Mistake => Some(2),
+                                                            engine::Quality::Blunder => Some(4),
+                                                            _ => None,
+                                                        }
+                                                    })
+                                                }).and_then(glyph_style);
                                                 let response = ui.add(
                                                     egui::Button::selectable(self.current == id, {
                                                         // Variations and your own analysis read as asides, not moves from the game.
