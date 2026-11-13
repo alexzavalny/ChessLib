@@ -35,8 +35,16 @@ pub fn open(path: &Path) -> Result<Connection> {
           INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text);
           INSERT INTO games_fts(rowid,search_text) VALUES(new.id,new.search_text); END;
         CREATE TRIGGER IF NOT EXISTS games_ad AFTER DELETE ON games BEGIN
-          INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text); END;
-        PRAGMA user_version=1;")?;
+          INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text); END;")?;
+    // Nested folders; each game sits in at most one. Checks the column, not user_version, which older builds reset to 1.
+    if db.query_row("SELECT count(*) FROM pragma_table_info('games') WHERE name='folder'", [], |r| r.get::<_, i64>(0))? == 0 {
+        db.execute_batch("BEGIN;
+            CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES folders(id), name TEXT NOT NULL);
+            ALTER TABLE games ADD COLUMN folder INTEGER REFERENCES folders(id);
+            CREATE INDEX games_folder_id ON games(folder, id);
+            COMMIT;")?;
+    }
+    db.execute_batch("PRAGMA user_version=2;")?;
     Ok(db)
 }
 
@@ -47,6 +55,8 @@ pub struct Filter {
     pub starred: bool,
     /// Only games of this event (exact name); None for any.
     pub event: Option<String>,
+    /// Only games in this folder or its subfolders; None for any.
+    pub folder: Option<i64>,
 }
 impl Filter {
     fn fts(&self) -> String {
@@ -59,7 +69,8 @@ impl Filter {
     }
     fn clause(&self) -> String {
         format!(
-            "WHERE (?1 = '' OR source = ?1) AND (?2 = 0 OR starred = 1) AND (?4 IS NULL OR event = ?4) {}",
+            "WHERE (?1 = '' OR source = ?1) AND (?2 = 0 OR starred = 1) AND (?4 IS NULL OR event = ?4)
+            AND (?5 IS NULL OR folder IN (WITH RECURSIVE t(id) AS (SELECT ?5 UNION ALL SELECT f.id FROM folders f JOIN t ON f.parent = t.id) SELECT id FROM t)) {}",
             if self.fts().is_empty() {
                 "AND ?3 = ''"
             } else {
@@ -84,7 +95,61 @@ pub struct Page {
     pub total: i64,
     pub all: i64,
     pub sources: Vec<(String, i64)>,
+    pub folders: Vec<Folder>,
     pub more: bool,
+}
+/// A folder with the number of games in it and all its subfolders; folders come sorted by name.
+#[derive(Clone)]
+pub struct Folder {
+    pub id: i64,
+    pub parent: Option<i64>,
+    pub name: String,
+    pub games: i64,
+}
+pub fn folders(db: &Connection) -> Result<Vec<Folder>> {
+    let mut folders: Vec<Folder> = db
+        .prepare("SELECT id, parent, name, (SELECT count(*) FROM games WHERE folder = folders.id) FROM folders ORDER BY name COLLATE NOCASE")?
+        .query_map([], |r| Ok(Folder { id: r.get(0)?, parent: r.get(1)?, name: r.get(2)?, games: r.get(3)? }))?
+        .collect::<rusqlite::Result<_>>()?;
+    // Add each folder's own count to every ancestor.
+    let parents: std::collections::HashMap<i64, Option<i64>> = folders.iter().map(|f| (f.id, f.parent)).collect();
+    let own: Vec<(Option<i64>, i64)> = folders.iter().map(|f| (f.parent, f.games)).collect();
+    for (mut parent, games) in own {
+        while let Some(id) = parent {
+            folders.iter_mut().find(|f| f.id == id).unwrap().games += games;
+            parent = parents[&id];
+        }
+    }
+    Ok(folders)
+}
+pub fn create_folder(db: &Connection, parent: Option<i64>, name: &str) -> Result<i64> {
+    db.execute("INSERT INTO folders(parent, name) VALUES(?, ?)", params![parent, name])?;
+    Ok(db.last_insert_rowid())
+}
+pub fn rename_folder(db: &Connection, id: i64, name: &str) -> Result<()> {
+    db.execute("UPDATE folders SET name=? WHERE id=?", params![name, id])?;
+    Ok(())
+}
+/// Deletes only the folder: its games and subfolders move up into its parent.
+pub fn delete_folder(db: &Connection, id: i64) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
+    let parent: Option<i64> = tx.query_row("SELECT parent FROM folders WHERE id=?", [id], |r| r.get(0))?;
+    tx.execute("UPDATE games SET folder=? WHERE folder=?", params![parent, id])?;
+    tx.execute("UPDATE folders SET parent=? WHERE parent=?", params![parent, id])?;
+    tx.execute("DELETE FROM folders WHERE id=?", [id])?;
+    tx.commit()?;
+    Ok(())
+}
+/// Files games imported after `after` that have no folder yet into `folder`.
+pub fn file_imported(db: &Connection, after: i64, folder: i64) -> Result<usize> {
+    Ok(db.execute("UPDATE games SET folder=?1 WHERE id > ?2 AND folder IS NULL", params![folder, after])?)
+}
+/// Moves one game, or with `id` None every game matching `filter`, into `folder` (None takes them out of folders).
+pub fn move_games(db: &Connection, filter: &Filter, id: Option<i64>, folder: Option<i64>) -> Result<usize> {
+    Ok(db.execute(
+        &format!("UPDATE games SET folder=?7 {} AND (?6 IS NULL OR id=?6)", filter.clause()),
+        params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, id, folder],
+    )?)
 }
 pub struct Loaded {
     pub id: i64,
@@ -129,11 +194,11 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
     let fts = filter.fts();
     let total = db.query_row(
         &format!("SELECT count(*) FROM games {clause}"),
-        params![filter.source, filter.starred, fts, filter.event],
+        params![filter.source, filter.starred, fts, filter.event, filter.folder],
         |r| r.get(0),
     )?;
     let all = db.query_row("SELECT count(*) FROM games", [], |r| r.get(0))?;
-    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?5 ORDER BY id DESC LIMIT ?6"))?;
+    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?6 ORDER BY id DESC LIMIT ?7"))?;
     let mut rows = stmt
         .query_map(
             params![
@@ -141,6 +206,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
                 filter.starred,
                 fts,
                 filter.event,
+                filter.folder,
                 before,
                 PAGE_SIZE as i64 + 1
             ],
@@ -158,6 +224,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
         total,
         all,
         sources,
+        folders: folders(db)?,
         more,
     })
 }
@@ -358,10 +425,10 @@ pub fn export(db: &Connection, filter: &Filter, id: Option<i64>, path: &Path) ->
     let result = (|| -> Result<u64> {
         let mut out = BufWriter::new(file);
         let mut stmt = db.prepare(&format!(
-            "SELECT body,notes FROM games {} AND (?5 IS NULL OR id=?5) ORDER BY id",
+            "SELECT body,notes FROM games {} AND (?6 IS NULL OR id=?6) ORDER BY id",
             filter.clause()
         ))?;
-        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, id])?;
+        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, id])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
             let game: Game = serde_json::from_str(&row.get::<_, String>(0)?)?;
@@ -464,6 +531,33 @@ mod tests {
         assert_eq!(search(&db, &tal, i64::MAX).unwrap().total, 0);
         assert_eq!(search(&db, &Filter::default(), i64::MAX).unwrap().all, 1);
         db.execute("INSERT INTO games_fts(games_fts) VALUES('integrity-check')", []).unwrap();
+    }
+    #[test]
+    fn nested_folders_filter_move_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir.path().join("db")).unwrap();
+        let pgn = dir.path().join("input.pgn");
+        std::fs::write(&pgn, "[White \"Tal\"]\n\n1. e4 *\n\n[White \"Carlsen\"]\n\n1. d4 *\n\n[White \"Anand\"]\n\n1. c4 *").unwrap();
+        import(&mut db, &[pgn], &AtomicBool::new(false), |_| {}).unwrap();
+        let openings = create_folder(&db, None, "Openings").unwrap();
+        let sicilian = create_folder(&db, Some(openings), "Sicilian").unwrap();
+        let tal = Filter { query: "Tal".into(), ..Default::default() };
+        assert_eq!(move_games(&db, &tal, None, Some(sicilian)).unwrap(), 1);
+        let carlsen = search(&db, &Filter { query: "Carlsen".into(), ..Default::default() }, i64::MAX).unwrap().rows[0].id;
+        move_games(&db, &Filter::default(), Some(carlsen), Some(openings)).unwrap();
+        let count = |folder| search(&db, &Filter { folder: Some(folder), ..Default::default() }, i64::MAX).unwrap().total;
+        assert_eq!((count(openings), count(sicilian)), (2, 1), "a folder includes its subfolders");
+        let page = search(&db, &Filter::default(), i64::MAX).unwrap();
+        let games = |id| page.folders.iter().find(|f| f.id == id).unwrap().games;
+        assert_eq!((games(openings), games(sicilian)), (2, 1));
+        rename_folder(&db, sicilian, "Najdorf").unwrap();
+        let inner = create_folder(&db, Some(sicilian), "6.Bg5").unwrap();
+        delete_folder(&db, sicilian).unwrap();
+        assert_eq!(count(openings), 2, "deleting a folder keeps its games");
+        assert_eq!(folders(&db).unwrap().iter().find(|f| f.id == inner).unwrap().parent, Some(openings));
+        assert_eq!(search(&db, &Filter::default(), i64::MAX).unwrap().all, 3);
+        drop(db);
+        assert_eq!(open(&dir.path().join("db")).unwrap().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     }
     #[test]
     fn failed_export_preserves_existing_destination() {

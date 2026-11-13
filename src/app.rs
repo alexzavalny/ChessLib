@@ -6,9 +6,10 @@ use crate::{
 use eframe::egui::{self, Color32, RichText, Vec2};
 use objc2::{AnyThread, rc::Retained};
 use objc2_app_kit::NSSound;
-use objc2_foundation::{NSData, NSUserDefaults, ns_string};
+use objc2_foundation::{NSData, NSString, NSUserDefaults, ns_string};
 use shakmaty::{Color, EnPassantMode, Move, Position, Role, Square, fen::Fen};
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -55,6 +56,12 @@ struct Train {
     revealed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FolderEdit {
+    New(Option<i64>),
+    Rename(i64),
+}
+
 pub struct App {
     play: Option<Play>,
     play_setup: Option<PlaySettings>,
@@ -62,6 +69,12 @@ pub struct App {
     train_setup: bool,
     /// The game awaiting delete confirmation: id and "White — Black".
     delete_game: Option<(i64, String)>,
+    /// The folder name dialog: a new folder under the parent (None for top level), or a rename, with the typed name.
+    folder_edit: Option<(FolderEdit, String)>,
+    /// Folders shown closed in the sidebar tree.
+    collapsed: HashSet<i64>,
+    /// The folder open when the running import started; its new games are filed there.
+    import_folder: Option<i64>,
     train_player: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
@@ -111,6 +124,11 @@ pub struct App {
     engine_lines: usize,
     /// Height of the move list, set by dragging the rule below it.
     moves_height: f32,
+    /// Height of the sidebar folder tree, set by dragging the rule below it.
+    folders_height: f32,
+    /// Widths of the library and notebook panels, set by dragging their inner edges.
+    library_width: f32,
+    notebook_width: f32,
     analysis_error: Option<String>,
     continuous: bool,
     review_job: Option<engine::Job>,
@@ -231,6 +249,9 @@ impl App {
             play_setup: None,
             train_setup: false,
             delete_game: None,
+            folder_edit: None,
+            collapsed: HashSet::new(),
+            import_folder: None,
             train_player: String::new(),
             jump: None,
             event_list: None,
@@ -277,6 +298,12 @@ impl App {
             },
             moves_height: match NSUserDefaults::standardUserDefaults().doubleForKey(ns_string!("MovesHeight")) {
                 h if h < 80.0 => 260.0,
+                h => h as f32,
+            },
+            library_width: saved_width(ns_string!("LibraryWidth"), 302.0),
+            notebook_width: saved_width(ns_string!("NotebookWidth"), 310.0),
+            folders_height: match NSUserDefaults::standardUserDefaults().doubleForKey(ns_string!("FoldersHeight")) {
+                h if h < 40.0 => 170.0,
                 h => h as f32,
             },
             analysis_error: None,
@@ -394,12 +421,114 @@ impl App {
             Err(e) => self.error = Some(format!("Could not open game: {e}")),
         }
     }
+    /// The sidebar's folder tree: click to show a folder's games, right-click to add, rename or delete.
+    fn folder_tree(&mut self, ui: &mut egui::Ui, folders: &[library::Folder]) {
+        enum Action { Select(i64), New(Option<i64>), Rename(i64, String), Delete(i64, Option<i64>) }
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("FOLDERS").size(11.0).strong().color(GREEN));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+ New").on_hover_text("New top-level folder").clicked() {
+                    action = Some(Action::New(None));
+                }
+            });
+        });
+        if folders.is_empty() {
+            ui.small("Make folders for openings, courses or your own games.");
+        }
+        let tree = egui::ScrollArea::vertical().id_salt("folders").max_height(self.folders_height).auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (depth, folder) in folder_rows(folders, &self.collapsed) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(depth as f32 * 14.0);
+                    let height = 26.0;
+                    let toggle = ui.allocate_response(Vec2::new(14.0, height), egui::Sense::click());
+                    if folders.iter().any(|f| f.parent == Some(folder.id)) {
+                        let open = !self.collapsed.contains(&folder.id);
+                        let (c, r) = (toggle.rect.center(), 4.0);
+                        let points = if open {
+                            vec![c + Vec2::new(-r, -r * 0.6), c + Vec2::new(r, -r * 0.6), c + Vec2::new(0.0, r * 0.8)]
+                        } else {
+                            vec![c + Vec2::new(-r * 0.6, -r), c + Vec2::new(r * 0.8, 0.0), c + Vec2::new(-r * 0.6, r)]
+                        };
+                        let color = if toggle.hovered() { INK } else { MUTED };
+                        ui.painter().add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+                        if toggle.clicked() && !self.collapsed.remove(&folder.id) {
+                            self.collapsed.insert(folder.id);
+                        }
+                    }
+                    // A full-width row: name on the left, game count right-aligned in quieter figures.
+                    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::click());
+                    let selected = self.filter.folder == Some(folder.id);
+                    let painter = ui.painter();
+                    if selected {
+                        painter.rect(rect, 6, ui.visuals().selection.bg_fill, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+                    } else if response.hovered() {
+                        painter.rect_filled(rect, 6, ui.visuals().faint_bg_color);
+                    }
+                    let count = card_text(painter, &folder.games.to_string(), 12.0, if folder.games == 0 { BEVEL } else if selected { GREEN } else { MUTED }, f32::INFINITY, 1);
+                    let name = card_text(painter, &folder.name, 14.0, INK, rect.width() - count.size().x - 26.0, 1);
+                    painter.galley(rect.left_center() + Vec2::new(8.0, -name.size().y / 2.0), name, INK);
+                    painter.galley(rect.right_center() - Vec2::new(8.0 + count.size().x, count.size().y / 2.0), count, MUTED);
+                    if response.clicked() {
+                        action = Some(Action::Select(folder.id));
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("New subfolder…").clicked() {
+                            action = Some(Action::New(Some(folder.id)));
+                        }
+                        if ui.button("Rename…").clicked() {
+                            action = Some(Action::Rename(folder.id, folder.name.clone()));
+                        }
+                        if ui.button("Delete folder").on_hover_text("Its games and subfolders move up one level; no games are deleted.").clicked() {
+                            action = Some(Action::Delete(folder.id, folder.parent));
+                        }
+                        if action.is_some() {
+                            ui.close();
+                        }
+                    });
+                });
+            }
+        });
+        // Dragging past the last folder would only leave a dead zone, so the tree's own height caps it.
+        let full = tree.content_size.y.max(40.0);
+        resize_rule(ui, &mut self.folders_height, 40.0..=full, ns_string!("FoldersHeight"));
+        match action {
+            Some(Action::Select(id)) => {
+                // Clicking the open folder again shows every folder's games.
+                self.filter.folder = (self.filter.folder != Some(id)).then_some(id);
+                self.event_list = None;
+                self.refresh(true);
+            }
+            Some(Action::New(parent)) => self.folder_edit = Some((FolderEdit::New(parent), String::new())),
+            Some(Action::Rename(id, name)) => self.folder_edit = Some((FolderEdit::Rename(id), name)),
+            Some(Action::Delete(id, parent)) => {
+                match library::delete_folder(&self.db, id) {
+                    Ok(()) if self.filter.folder == Some(id) => self.filter.folder = parent,
+                    Ok(()) => {}
+                    Err(e) => self.error = Some(format!("Could not delete the folder: {e}")),
+                }
+                self.refresh(true);
+            }
+            None => {}
+        }
+    }
+    fn move_games(&mut self, id: Option<i64>, folder: Option<i64>) {
+        match library::move_games(&self.db, &self.filter, id, folder) {
+            Ok(1) => self.status = "Moved 1 game".into(),
+            Ok(n) => self.status = format!("Moved {n} games"),
+            Err(e) => self.error = Some(format!("Could not move games: {e}")),
+        }
+        self.refresh(false);
+    }
     fn import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         if paths.is_empty() || self.importing || !self.save() {
             return;
         }
         self.importing = true;
         self.import_floor = library::last_id(&self.db).unwrap_or(i64::MAX);
+        self.import_folder = self.filter.folder;
         self.progress = ImportStats::default();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.status = "Importing games… You can keep browsing.".into();
@@ -496,6 +625,12 @@ impl App {
                 Event::Progress(stats) => self.progress = stats,
                 Event::Imported(result) => {
                     self.importing = false;
+                    // Also after a stop or an error, so completed batches land in the folder too.
+                    if let Some(folder) = self.import_folder
+                        && let Err(e) = library::file_imported(&self.db, self.import_floor, folder)
+                    {
+                        self.error = Some(format!("Imported games could not be put in the folder: {e}"));
+                    }
                     match result {
                         Ok(stats) => {
                             self.status = format!(
@@ -531,12 +666,15 @@ impl App {
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
         let cloth = self.bookcloth.clone();
+        drag_panel_width(ctx, "library", true, &mut self.library_width, 240.0..=640.0, ns_string!("LibraryWidth"));
         egui::SidePanel::left("library")
-            .exact_width(302.0)
-            .resizable(false)
+            .exact_width(self.library_width)
+            .resizable(true)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(IVORY).inner_margin(18))
             .show(ctx, |ui| {
+                // Content laid out in a child, so anything too wide is clipped instead of widening the panel past its edge.
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect()));
                 // Carved ivory leaf, set slightly below the cover with a fold at its spine edge.
                 let rect = ui.max_rect().expand(18.0);
                 material(ui.painter(), &cloth, rect, Color32::from_rgb(240, 227, 206), 300.0);
@@ -565,13 +703,14 @@ impl App {
                 if response.changed() {
                     self.search_due = Some(Instant::now());
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let listing = self.event_list.is_some();
                     if ui
                         .selectable_label(!self.filter.starred && !listing, "All games")
                         .clicked()
                     {
                         self.filter.starred = false;
+                        self.filter.folder = None;
                         self.event_list = None;
                         self.refresh(true);
                     }
@@ -638,7 +777,8 @@ impl App {
                 if changed {
                     self.refresh(true);
                 }
-                ui.separator();
+                let folders = self.page.as_ref().map(|p| p.folders.clone()).unwrap_or_default();
+                self.folder_tree(ui, &folders);
                 if let Some((query, events)) = &mut self.event_list {
                     ui.add(
                         egui::TextEdit::singleline(query)
@@ -687,6 +827,17 @@ impl App {
                     if self.searching {
                         ui.spinner();
                     }
+                    if total > 0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.menu_button(RichText::new("Move all to folder").small(), |ui| {
+                                ui.small(format!("Moves the {total} games listed here"));
+                                if let Some(folder) = folder_picker(ui, &folders) {
+                                    self.move_games(None, folder);
+                                    ui.close();
+                                }
+                            });
+                        });
+                    }
                 });
                 egui::ScrollArea::vertical()
                     .id_salt("games")
@@ -716,6 +867,12 @@ impl App {
                                     self.start_training(Some(row.id));
                                     ui.close();
                                 }
+                                ui.menu_button("Move to folder", |ui| {
+                                    if let Some(folder) = folder_picker(ui, &folders) {
+                                        self.move_games(Some(row.id), folder);
+                                        ui.close();
+                                    }
+                                });
                                 ui.separator();
                                 if ui
                                     .add_enabled(self.play.is_none(), egui::Button::new("Delete…"))
@@ -1307,12 +1464,14 @@ impl App {
 
     fn notebook(&mut self, ctx: &egui::Context) {
         let cloth = self.bookcloth.clone();
+        drag_panel_width(ctx, "notebook", false, &mut self.notebook_width, 260.0..=720.0, ns_string!("NotebookWidth"));
         egui::SidePanel::right("notebook")
-            .exact_width(310.0)
-            .resizable(false)
+            .exact_width(self.notebook_width)
+            .resizable(true)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(PAPER).inner_margin(16))
             .show(ctx, |ui| {
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect()));
                 // The study notebook: a lighter paper page with a gutter shadow and a bookmark ribbon.
                 let rect = ui.max_rect().expand(16.0);
                 material(ui.painter(), &cloth, rect, Color32::from_rgb(252, 244, 232), 300.0);
@@ -1539,18 +1698,7 @@ impl App {
                                 .unwrap_or_else(|| "Game notes".into());
                             // The rule between moves and notes is a drag handle for the move list height.
                             ui.add_space(6.0);
-                            let (rule, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), egui::Sense::drag());
-                            let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
-                            if drag.dragged() {
-                                self.moves_height = (self.moves_height + drag.drag_delta().y).clamp(80.0, 900.0);
-                            }
-                            if drag.drag_stopped() {
-                                NSUserDefaults::standardUserDefaults()
-                                    .setDouble_forKey(self.moves_height as _, ns_string!("MovesHeight"));
-                            }
-                            let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
-                            ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
-                            ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
+                            resize_rule(ui, &mut self.moves_height, 80.0..=900.0, ns_string!("MovesHeight"));
                             // Notes autosave shortly after typing; ⌘S saves immediately.
                             header(ui, title, if self.dirty { "Unsaved" } else { "Saved" });
                             if let Some(loaded) = &mut self.loaded {
@@ -2306,6 +2454,43 @@ impl eframe::App for App {
                 self.train_setup = false;
             }
         }
+        if let Some((edit, mut name)) = self.folder_edit.take() {
+            let (mut save, mut cancel) = (false, false);
+            let modal = egui::Modal::new(egui::Id::new("folder")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading(match edit {
+                    FolderEdit::New(None) => "New folder",
+                    FolderEdit::New(Some(_)) => "New subfolder",
+                    FolderEdit::Rename(_) => "Rename folder",
+                });
+                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Folder name").desired_width(f32::INFINITY));
+                field.request_focus();
+                save = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save |= ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save").fill(GREEN)).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            // Trim only on save; trimming while typing would swallow each space as it is typed.
+            let trimmed = name.trim();
+            if save && !trimmed.is_empty() {
+                let name = trimmed.to_owned();
+                let result = match edit {
+                    FolderEdit::New(parent) => library::create_folder(&self.db, parent, &name).map(|_| {
+                        // Open the parent so the new folder shows.
+                        if let Some(parent) = parent { self.collapsed.remove(&parent); }
+                    }),
+                    FolderEdit::Rename(id) => library::rename_folder(&self.db, id, &name),
+                };
+                if let Err(e) = result {
+                    self.error = Some(format!("Could not save the folder: {e}"));
+                }
+                self.refresh(false);
+            } else if !cancel && !modal.should_close() {
+                self.folder_edit = Some((edit, name));
+            }
+        }
         if let Some((id, title)) = &self.delete_game {
             let (id, mut delete, mut cancel) = (*id, false, false);
             let modal = egui::Modal::new(egui::Id::new("delete")).show(ctx, |ui| {
@@ -2993,4 +3178,74 @@ fn pretty_dates() {
     assert_eq!(pretty_date("1858.??.??").as_deref(), Some("1858"));
     assert_eq!(pretty_date("????.??.??"), None);
     assert_eq!(pretty_date(""), None);
+}
+
+/// Folders depth-first with their depth, leaving out the insides of collapsed ones.
+fn folder_rows<'a>(folders: &'a [library::Folder], collapsed: &HashSet<i64>) -> Vec<(usize, &'a library::Folder)> {
+    fn walk<'a>(folders: &'a [library::Folder], parent: Option<i64>, depth: usize, collapsed: &HashSet<i64>, out: &mut Vec<(usize, &'a library::Folder)>) {
+        for folder in folders.iter().filter(|f| f.parent == parent) {
+            out.push((depth, folder));
+            if !collapsed.contains(&folder.id) {
+                walk(folders, Some(folder.id), depth + 1, collapsed, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(folders, None, 0, collapsed, &mut out);
+    out
+}
+
+/// "No folder" and every folder, indented; returns the choice, Some(None) for no folder.
+fn folder_picker(ui: &mut egui::Ui, folders: &[library::Folder]) -> Option<Option<i64>> {
+    let mut chosen = None;
+    if ui.button("No folder").clicked() {
+        chosen = Some(None);
+    }
+    for (depth, folder) in folder_rows(folders, &HashSet::new()) {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 14.0);
+            if ui.button(&folder.name).clicked() {
+                chosen = Some(Some(folder.id));
+            }
+        });
+    }
+    chosen
+}
+
+/// A horizontal rule that resizes the area above it when dragged; the height is kept in user defaults under `key`.
+fn resize_rule(ui: &mut egui::Ui, height: &mut f32, range: std::ops::RangeInclusive<f32>, key: &NSString) {
+    let (rule, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), egui::Sense::drag());
+    let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    if drag.dragged() {
+        // Start from what is shown, so a height above the range's end has no dead zone.
+        *height = (height.min(*range.end()) + drag.drag_delta().y).clamp(*range.start(), *range.end());
+    }
+    if drag.drag_stopped() {
+        NSUserDefaults::standardUserDefaults().setDouble_forKey(*height as _, key);
+    }
+    let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
+    ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
+    ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
+}
+
+fn saved_width(key: &NSString, default: f32) -> f32 {
+    match NSUserDefaults::standardUserDefaults().doubleForKey(key) {
+        w if w < 200.0 => default,
+        w => w as f32,
+    }
+}
+
+/// Sets a side panel's width from a drag on egui's edge handle, saving it when the drag ends.
+/// The panel itself stays at an exact width: with a width range, egui stores the content's width,
+/// so content slightly wider than the panel pushed the edge outward a little every frame.
+fn drag_panel_width(ctx: &egui::Context, id: &str, left: bool, width: &mut f32, range: std::ops::RangeInclusive<f32>, key: &NSString) {
+    let Some(handle) = ctx.read_response(egui::Id::new(id).with("__resize")) else { return };
+    if handle.dragged() && let Some(pointer) = handle.interact_pointer_pos() {
+        let screen = ctx.content_rect();
+        let wanted = if left { pointer.x - screen.left() } else { screen.right() - pointer.x };
+        *width = wanted.clamp(*range.start(), *range.end());
+    }
+    if handle.drag_stopped() {
+        NSUserDefaults::standardUserDefaults().setDouble_forKey(*width as _, key);
+    }
 }
