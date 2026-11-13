@@ -27,6 +27,9 @@ pub struct Game {
     /// Arrows and circles drawn on each move's board: from and to square indices (equal for a circle) and a brush, G, R, B or Y.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub drawings: BTreeMap<usize, Vec<(u8, u8, char)>>,
+    /// Move marks the reader set, as NAGs 1–6 (! ? !! ?? !? ?!); 0 hides an imported mark.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub glyphs: BTreeMap<usize, u8>,
     /// The reader flipped the board to see this game from Black's side.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flipped: bool,
@@ -214,7 +217,7 @@ impl Game {
                     out.push_str(&format!("[{name} \"{value}\"]\n"));
                 }
                 out.push('\n');
-                replay.write_pgn(notes, &mut out);
+                replay.write_pgn(notes, &self.glyphs, &mut out);
                 out.push_str(if self.tag("Result").is_empty() {
                     "*"
                 } else {
@@ -365,6 +368,20 @@ impl Replay {
             - 1
     }
 
+    /// The move's mark as a NAG 1–6: the reader's own, else the first imported one.
+    pub fn glyph(&self, glyphs: &BTreeMap<usize, u8>, id: usize) -> Option<u8> {
+        glyphs
+            .get(&id)
+            .copied()
+            .or_else(|| {
+                self.nodes[id].annotations.iter().find_map(|t| match t {
+                    Token::Nag(n @ 1..=6) => Some(*n),
+                    _ => None,
+                })
+            })
+            .filter(|&n| n != 0)
+    }
+
     pub fn label(&self, id: usize) -> String {
         let absolute = self.half_move(id);
         format!(
@@ -379,7 +396,7 @@ impl Replay {
         )
     }
 
-    fn write_pgn(&self, notes: &Notes, out: &mut String) {
+    fn write_pgn(&self, notes: &Notes, glyphs: &BTreeMap<usize, u8>, out: &mut String) {
         enum Action {
             Node(usize),
             Children(usize),
@@ -399,9 +416,15 @@ impl Replay {
                         out.push_str(&self.label(id).replace('…', "..."));
                         out.push(' ');
                     }
+                    // The reader's own mark replaces any imported move mark.
+                    let own = glyphs.get(&id);
+                    if let Some(&n) = own.filter(|&&n| n != 0) {
+                        out.push_str(&format!("${n} "));
+                    }
                     for token in &self.nodes[id].annotations {
                         match token {
                             Token::Comment(s) => write_comment(out, s),
+                            Token::Nag(1..=6) if own.is_some() => {}
                             Token::Nag(n) => out.push_str(&format!("${n} ")),
                             _ => {}
                         }
@@ -546,6 +569,18 @@ mod tests {
         assert!(exported.contains("c5 $1"));
         assert!(exported.contains("My (idea)"));
     }
+    #[test]
+    fn own_move_marks_replace_imported_ones() {
+        let mut game = parse("1. e4 $1 e5 $2 2. Nf3 $14 *");
+        let replay = game.replay().unwrap();
+        assert_eq!(replay.glyph(&game.glyphs, 1), Some(1));
+        assert_eq!(replay.glyph(&game.glyphs, 3), None, "$14 is not a move mark");
+        game.glyphs.extend([(1, 3), (2, 0), (3, 6)]);
+        assert_eq!(replay.glyph(&game.glyphs, 2), None);
+        let exported = game.export(&Notes::new()).unwrap();
+        assert!(exported.contains("1. e4 $3 1... e5 2. Nf3 $6 $14 *"), "{exported}");
+    }
+
     #[test]
     fn fen_black_to_move_and_illegal_move() {
         let game = parse("[FEN \"8/8/8/8/8/6k1/8/4K3 b - - 0 42\"]\n\n42... Kf3 *");

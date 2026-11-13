@@ -1367,11 +1367,19 @@ impl App {
                                                 let noted = self.loaded.as_ref().is_some_and(|l| {
                                                     l.notes.get(&id).is_some_and(|n| !n.is_empty())
                                                 });
+                                                let glyphs = self.loaded.as_ref().map(|l| &l.game.glyphs);
+                                                let glyph = glyphs.and_then(|g| replay.glyph(g, id)).and_then(glyph_style);
                                                 let response = ui.add(
                                                     egui::Button::selectable(self.current == id, {
                                                         // Variations and your own analysis read as asides, not moves from the game.
                                                         let san = RichText::new(&replay.nodes[id].san);
-                                                        if replay.in_game(id) { san } else { san.italics().color(MUTED) }
+                                                        let san = if replay.in_game(id) { san } else { san.italics().color(MUTED) };
+                                                        let mut job = egui::text::LayoutJob::default();
+                                                        san.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                                                        if let Some((symbol, color, _)) = glyph {
+                                                            RichText::new(symbol).strong().color(color).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                                                        }
+                                                        job
                                                     })
                                                         .min_size(cell)
                                                         .right_text(RichText::new(if noted { "•" } else { "" }).color(RIBBON)),
@@ -1383,6 +1391,22 @@ impl App {
                                                     next = id;
                                                 }
                                                 if let Some(loaded) = &mut self.loaded {
+                                                    // Right-click a move to mark it, as Lichess's ! ? buttons.
+                                                    response.context_menu(|ui| {
+                                                        let mut chosen = None;
+                                                        for nag in [3, 1, 5, 6, 2, 4] {
+                                                            let (symbol, color, name) = glyph_style(nag).unwrap();
+                                                            let text = RichText::new(format!("{symbol}  {name}")).color(color);
+                                                            if ui.add(egui::Button::selectable(glyph.is_some_and(|g| g.0 == symbol), text)).clicked() { chosen = Some(nag); }
+                                                        }
+                                                        if glyph.is_some() && ui.button("Remove mark").clicked() { chosen = Some(0); }
+                                                        if let Some(nag) = chosen {
+                                                            loaded.game.glyphs.insert(id, nag);
+                                                            self.dirty = true;
+                                                            self.edited = Instant::now();
+                                                            ui.close();
+                                                        }
+                                                    });
                                                     if response.double_clicked() {
                                                         let marks = &mut loaded.game.bookmarks;
                                                         if !marks.remove(&id) { marks.insert(id); }
@@ -2536,6 +2560,19 @@ fn quality_style(quality: engine::Quality) -> (Color32, &'static str) {
         engine::Quality::Mistake => (RIBBON, "?"),
         engine::Quality::Blunder => (Color32::from_rgb(128, 28, 24), "??"),
     }
+}
+
+/// A move mark's symbol, colour and name, for NAGs 1–6; the colours follow `quality_style`.
+fn glyph_style(nag: u8) -> Option<(&'static str, Color32, &'static str)> {
+    Some(match nag {
+        1 => ("!", Color32::from_rgb(110, 122, 92), "Good move"),
+        2 => ("?", RIBBON, "Mistake"),
+        3 => ("!!", CLOTH, "Brilliant move"),
+        4 => ("??", Color32::from_rgb(128, 28, 24), "Blunder"),
+        5 => ("!?", Color32::from_rgb(70, 110, 150), "Interesting move"),
+        6 => ("?!", Color32::from_rgb(184, 138, 40), "Dubious move"),
+        _ => return None,
+    })
 }
 
 fn move_destination(movement: Move) -> Square {
