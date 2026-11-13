@@ -33,6 +33,9 @@ pub struct Game {
     /// The reader flipped the board to see this game from Black's side.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flipped: bool,
+    /// Side lines the reader promoted: parent node to the child that now continues it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub promoted: BTreeMap<usize, usize>,
     #[serde(skip)]
     bytes: usize,
 }
@@ -153,12 +156,82 @@ impl Game {
             replay.nodes[movement.parent].children.push(id);
             replay.nodes.push(node);
         }
+        for (&parent, &child) in &self.promoted {
+            anyhow::ensure!(
+                replay.nodes.get(child).is_some_and(|n| n.parent == Some(parent)),
+                "Invalid promoted variation"
+            );
+            // The move played in the game always stays first.
+            if !replay.in_game(replay.nodes[parent].children[0]) {
+                let children = &mut replay.nodes[parent].children;
+                children.retain(|&c| c != child);
+                children.insert(0, child);
+            }
+        }
         Ok(replay)
+    }
+
+    /// The first node ID that belongs to a line the reader added; lower IDs come from the PGN.
+    pub fn first_added(&self, replay: &Replay) -> usize {
+        replay.nodes.len() - self.study.len()
+    }
+
+    /// Makes `id` the continuation of its parent's line, unless the parent's next move was played in the game.
+    pub fn promote(&mut self, replay: &Replay, id: usize) -> bool {
+        let Some(parent) = replay.nodes[id].parent else { return false };
+        let first = replay.nodes[parent].children[0];
+        if first == id || replay.in_game(first) || replay.nodes[id].position.is_none() {
+            return false;
+        }
+        self.promoted.insert(parent, id);
+        true
+    }
+
+    /// Removes an added line from `id` onward, with its notes, marks and drawings; IDs of later added moves shift down.
+    pub fn delete_line(&mut self, replay: &Replay, notes: &mut Notes, id: usize) -> bool {
+        let base = self.first_added(replay);
+        if id < base {
+            return false;
+        }
+        let mut removed = std::collections::BTreeSet::from([id]);
+        // Study moves come after their parents, so one forward pass collects the whole subtree.
+        for (i, movement) in self.study.iter().enumerate() {
+            if removed.contains(&movement.parent) {
+                removed.insert(base + i);
+            }
+        }
+        let remap = |old: usize| -> Option<usize> {
+            if removed.contains(&old) {
+                None
+            } else if old < base {
+                Some(old)
+            } else {
+                Some(old - removed.range(..old).count())
+            }
+        };
+        let mut i = base;
+        self.study.retain(|_| {
+            i += 1;
+            !removed.contains(&(i - 1))
+        });
+        for movement in &mut self.study {
+            movement.parent = remap(movement.parent).unwrap();
+        }
+        *notes = std::mem::take(notes).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
+        self.drawings = std::mem::take(&mut self.drawings).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
+        self.glyphs = std::mem::take(&mut self.glyphs).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
+        self.bookmarks = std::mem::take(&mut self.bookmarks).into_iter().filter_map(remap).collect();
+        self.promoted = std::mem::take(&mut self.promoted)
+            .into_iter()
+            .filter_map(|(p, c)| Some((remap(p)?, remap(c)?)))
+            .collect();
+        true
     }
 
     pub fn mainline_positions(&self) -> Result<Vec<(usize, Chess)>> {
         let mut original = self.clone();
         original.study.clear();
+        original.promoted.clear();
         let replay = original.replay()?;
         let mut positions = Vec::new();
         let mut id = 0;
@@ -642,6 +715,31 @@ mod tests {
                 && exported.contains("French")
                 && exported.contains("old main-line note")
         );
+    }
+
+    #[test]
+    fn promote_and_delete_added_lines() {
+        let mut game = parse("1. e4 e5 (1... c5) 2. Nf3 *");
+        let mut replay = game.replay().unwrap();
+        let d5 = play_san(&mut game, &mut replay, 1, "d5");
+        let exd5 = play_san(&mut game, &mut replay, d5, "exd5");
+        let nc3 = play_san(&mut game, &mut replay, d5, "Nc3");
+        let d4 = play_san(&mut game, &mut replay, 0, "d4");
+        let mut notes = Notes::from([(exd5, "gone".into()), (d4, "kept".into()), (2, "game".into())]);
+        game.glyphs.insert(d4, 1);
+        assert!(game.promote(&replay, nc3));
+        assert!(!game.promote(&replay, d5), "the game's own move stays first");
+        let replay = game.replay().unwrap();
+        assert_eq!(replay.nodes[d5].children, vec![nc3, exd5]);
+        assert!(!game.delete_line(&replay, &mut notes, 4), "imported c5 stays");
+        assert!(game.delete_line(&replay, &mut notes, d5));
+        let replay = game.replay().unwrap();
+        assert_eq!(game.study.len(), 1);
+        assert_eq!(replay.nodes[d5].san, "d4", "later added moves shift into the freed IDs");
+        assert_eq!(notes, Notes::from([(2, "game".into()), (d5, "kept".into())]));
+        assert_eq!(game.glyphs, BTreeMap::from([(d5, 1)]));
+        assert!(game.promoted.is_empty());
+        assert!(!game.export(&notes).unwrap().contains("d5"));
     }
 
     #[test]

@@ -1332,6 +1332,8 @@ impl App {
                             );
                             return;
                         }
+                        let mut rebuild = false;
+                        let editable = self.play.is_none();
                         if let Some(replay) = &self.replay {
                             let mut next = self.current;
                             let line = replay.line(self.current);
@@ -1364,6 +1366,7 @@ impl App {
                                                         ui.label("");
                                                     }
                                                 }
+                                                let alternatives = &replay.nodes[replay.nodes[id].parent.unwrap()].children;
                                                 let noted = self.loaded.as_ref().is_some_and(|l| {
                                                     l.notes.get(&id).is_some_and(|n| !n.is_empty())
                                                 });
@@ -1389,11 +1392,21 @@ impl App {
                                                         if let Some((symbol, color, _)) = glyph {
                                                             RichText::new(symbol).strong().color(color).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
                                                         }
+                                                        // "+2": this move has two alternatives.
+                                                        if alternatives.len() > 1 {
+                                                            RichText::new(format!(" +{}", alternatives.len() - 1)).small().color(RIBBON).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                                                        }
                                                         job
                                                     })
                                                         .min_size(cell)
                                                         .right_text(RichText::new(if noted { "•" } else { "" }).color(RIBBON)),
                                                 );
+                                                let response = if alternatives.len() > 1 {
+                                                    let others: Vec<_> = alternatives.iter().filter(|&&a| a != id).map(|&a| replay.nodes[a].san.as_str()).collect();
+                                                    response.on_hover_text(format!("Alternatives: {}", others.join(", ")))
+                                                } else {
+                                                    response
+                                                };
                                                 if self.current == id && self.scrolled_node != Some(id) {
                                                     response.scroll_to_me(Some(egui::Align::Center));
                                                 }
@@ -1412,6 +1425,27 @@ impl App {
                                                         if glyph.is_some() && ui.button("Remove mark").clicked() { chosen = Some(0); }
                                                         if let Some(nag) = chosen {
                                                             loaded.game.glyphs.insert(id, nag);
+                                                            self.dirty = true;
+                                                            self.edited = Instant::now();
+                                                            ui.close();
+                                                        }
+                                                        if !editable { return; }
+                                                        let parent = replay.nodes[id].parent.unwrap();
+                                                        let first = replay.nodes[parent].children[0];
+                                                        let promotable = first != id && !replay.in_game(first) && replay.nodes[id].position.is_some();
+                                                        let added = id >= loaded.game.first_added(replay);
+                                                        if promotable || added { ui.separator(); }
+                                                        if promotable && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
+                                                            loaded.game.promote(replay, id);
+                                                            rebuild = true;
+                                                        }
+                                                        if added && ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
+                                                            let l = &mut *loaded;
+                                                            l.game.delete_line(replay, &mut l.notes, id);
+                                                            next = parent;
+                                                            rebuild = true;
+                                                        }
+                                                        if rebuild {
                                                             self.dirty = true;
                                                             self.edited = Instant::now();
                                                             ui.close();
@@ -1488,6 +1522,11 @@ impl App {
                             if let Some(warning) = &replay.warning {
                                 ui.colored_label(Color32::from_rgb(163, 91, 36), warning);
                             }
+                        }
+                        // Promoting or deleting changes the tree's order and IDs, so rebuild it from the saved edit.
+                        if rebuild && let Some(loaded) = &self.loaded {
+                            self.replay = loaded.game.replay().ok();
+                            self.scrolled_node = None;
                         }
                         if self.play.is_some() {
                             self.play_panel(ui, ctx);
@@ -1837,6 +1876,15 @@ impl App {
             {
                 // Deep bookcloth green reads on both the ivory and the green squares.
                 arrow(suggested, Color32::from_rgba_unmultiplied(CLOTH.r(), CLOTH.g(), CLOTH.b(), 190), cell * 0.32, cell * 0.11);
+            }
+            // Where the line branches, an arrow for each next move: the continuation bolder, alternatives fainter.
+            let children = &replay.nodes[self.current].children;
+            if children.len() > 1 && self.play.is_none() && let Some(before) = &replay.nodes[self.current].position {
+                for (i, &child) in children.iter().enumerate().rev() {
+                    let Some(movement) = parse(before, &replay.nodes[child].san) else { continue };
+                    let (alpha, head, width) = if i == 0 { (200, cell * 0.36, cell * 0.13) } else { (130, cell * 0.3, cell * 0.1) };
+                    arrow(movement, Color32::from_rgba_unmultiplied(120, 80, 40, alpha), head, width);
+                }
             }
             // Engine lines as arrows over the pieces, weakest first so the best sits on top.
             // The legality check guards a stale evaluation.
