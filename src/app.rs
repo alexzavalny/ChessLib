@@ -1477,7 +1477,11 @@ impl App {
                             }
                             let main = replay.line(0);
                             if !main.contains(&self.current) && ui.button("Return to main line").clicked() {
-                                next = main[node.ply.min(main.len() - 1)];
+                                // Back to the game move the side line branched from.
+                                next = self.current;
+                                while !main.contains(&next) {
+                                    next = replay.nodes[next].parent.unwrap();
+                                }
                             }
                             self.scrolled_node = Some(self.current);
                             self.current = next;
