@@ -88,6 +88,8 @@ pub struct App {
     /// Another library folder was chosen: start a new app on it once this window has saved and closes.
     relaunch: bool,
     train_player: String,
+    /// The text typed into an open "+ Tag" menu.
+    tag_draft: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
     /// The Events list while it replaces the games list: its name filter and every event.
@@ -266,6 +268,7 @@ impl App {
             import_folder: None,
             relaunch: false,
             train_player: String::new(),
+            tag_draft: String::new(),
             jump: None,
             event_list: None,
             import_floor: 0,
@@ -654,8 +657,13 @@ impl App {
                                 }
                             }
                             self.flipped = loaded.game.flipped;
+                            // Opened from a tag filter: start at the first position carrying that tag.
+                            self.current = self.filter.tag.as_ref().and_then(|tag| {
+                                let (node, _) = loaded.game.position_labels.iter().find(|(_, names)| names.contains(tag))?;
+                                self.replay.as_ref()?.nodes.get(*node)?.position.as_ref()?;
+                                Some(*node)
+                            }).unwrap_or(0);
                             self.loaded = Some(loaded);
-                            self.current = 0;
                             self.scrolled_node = None;
                             self.dirty = false;
                         }
@@ -756,6 +764,7 @@ impl App {
                     {
                         self.filter.starred = false;
                         self.filter.folder = None;
+                        self.filter.tag = None;
                         self.event_list = None;
                         self.refresh(true);
                     }
@@ -824,6 +833,29 @@ impl App {
                 }
                 let folders = self.page.as_ref().map(|p| p.folders.clone()).unwrap_or_default();
                 self.folder_tree(ui, &folders);
+                let labels = self.page.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
+                ui.label(RichText::new("TAGS").size(11.0).strong().color(GREEN));
+                if labels.is_empty() {
+                    ui.small("Tag a game under its title, or a position under its notes.");
+                }
+                let mut chosen = None;
+                egui::ScrollArea::vertical().id_salt("tags").max_height(84.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                        for (name, games) in &labels {
+                            let selected = self.filter.tag.as_ref() == Some(name);
+                            if tag_chip(ui, name, Some(&games.to_string()), selected).clicked() {
+                                chosen = Some(name.clone());
+                            }
+                        }
+                    });
+                });
+                if let Some(name) = chosen {
+                    // Clicking the active tag again shows every tag's games.
+                    self.filter.tag = (self.filter.tag.as_ref() != Some(&name)).then_some(name);
+                    self.event_list = None;
+                    self.refresh(true);
+                }
                 if let Some((query, events)) = &mut self.event_list {
                     ui.add(
                         egui::TextEdit::singleline(query)
@@ -1574,6 +1606,7 @@ impl App {
                                                 let noted = self.loaded.as_ref().is_some_and(|l| {
                                                     l.notes.get(&id).is_some_and(|n| !n.is_empty())
                                                 });
+                                                let tagged = self.loaded.as_ref().and_then(|l| l.game.position_labels.get(&id)?.first().cloned());
                                                 // Your mark, else the PGN's, else the game review's verdict, as on Lichess; a removed mark hides all.
                                                 let glyph = self.loaded.as_ref().and_then(|l| {
                                                     replay.glyph(&l.game.glyphs, id).or_else(|| {
@@ -1603,7 +1636,15 @@ impl App {
                                                         job
                                                     })
                                                         .min_size(cell)
-                                                        .right_text(RichText::new(if noted { "•" } else { "" }).color(RIBBON)),
+                                                        .right_text({
+                                                            // A diamond in the position's tag colour, then a dot for a note.
+                                                            let mut job = egui::text::LayoutJob::default();
+                                                            if let Some(tag) = &tagged {
+                                                                RichText::new("◆").size(9.0).color(tag_color(tag)).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                                                            }
+                                                            RichText::new(if noted { "•" } else { "" }).color(RIBBON).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                                                            job
+                                                        }),
                                                 );
                                                 let response = if alternatives.len() > 1 {
                                                     let others: Vec<_> = alternatives.iter().filter(|&&a| a != id).map(|&a| replay.nodes[a].san.as_str()).collect();
@@ -1778,6 +1819,18 @@ impl App {
                                     self.dirty = true;
                                     self.edited = Instant::now();
                                 }
+                                if self.current > 0 {
+                                    let known = self.page.as_ref().map(|p| p.labels.as_slice()).unwrap_or_default();
+                                    let tags = loaded.game.position_labels.entry(self.current).or_default();
+                                    let changed = tag_editor(ui, tags, known, &mut self.tag_draft, "position");
+                                    if tags.is_empty() {
+                                        loaded.game.position_labels.remove(&self.current);
+                                    }
+                                    if changed {
+                                        self.dirty = true;
+                                        if self.save() { self.refresh(false); }
+                                    }
+                                }
                             }
                             if let Some(replay) = &self.replay {
                                 for annotation in &replay.nodes[self.current].annotations {
@@ -1847,6 +1900,14 @@ impl App {
                 }
             });
             ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
+            if self.play.is_none() {
+                let known = self.page.as_ref().map(|p| p.labels.as_slice()).unwrap_or_default();
+                let loaded = self.loaded.as_mut().unwrap();
+                if tag_editor(ui, &mut loaded.game.labels, known, &mut self.tag_draft, "game") {
+                    self.dirty = true;
+                    if self.save() { self.refresh(false); }
+                }
+            }
             ui.add_space(14.0);
             if self.loading { ui.spinner(); }
             let Some(replay) = &self.replay else { ui.label("Board unavailable for this game. You can still add game notes and export it."); return; };
@@ -3132,16 +3193,18 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
     };
     let event_line = layout(event, 11.5, MUTED, width - 26.0, 2);
     let metadata_height = if metadata.is_empty() { 0.0 } else { 16.0 };
+    let tags_height = if row.labels.is_empty() { 0.0 } else { 26.0 };
     let (_, rect) = ui.allocate_space(Vec2::new(
         width,
-        50.0 + event_line.size().y + metadata_height,
+        50.0 + event_line.size().y + metadata_height + tags_height,
     ));
     let response = ui.interact(rect, ui.make_persistent_id(row.id), egui::Sense::click());
     let details = || {
         format!(
-            "{}White: {white}\nBlack: {black}\n{event}\n{metadata}\n{}",
+            "{}White: {white}\nBlack: {black}\n{event}\n{metadata}\n{}{}",
             if row.starred { "Favourite\n" } else { "" },
             row.result,
+            if row.labels.is_empty() { String::new() } else { format!("\nTags: {}", row.labels.join(", ")) },
         )
     };
     response.widget_info(|| {
@@ -3195,6 +3258,21 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         let line = layout(&metadata, 11.0, GREEN, width - 26.0, 1);
         truncated |= line.elided;
         painter.galley(egui::pos2(left, metadata_y), line, GREEN);
+    }
+    // Tags in one row along the bottom; those that do not fit become "+N".
+    let mut x = left;
+    for (i, name) in row.labels.iter().enumerate() {
+        let pill = Pill::new(&painter, name, None, 120.0);
+        let room = rect.right() - 13.0 - x - if i + 1 < row.labels.len() { 30.0 } else { 0.0 };
+        if pill.size().x > room {
+            let more = layout(&format!("+{}", row.labels.len() - i), 11.0, MUTED, 40.0, 1);
+            painter.galley(egui::pos2(x, rect.bottom() - 17.0 - more.size().y / 2.0), more, MUTED);
+            truncated = true;
+            break;
+        }
+        let size = pill.size();
+        x += size.x + 5.0;
+        pill.paint(&painter, egui::Rect::from_min_size(egui::pos2(x - size.x - 5.0, rect.bottom() - 17.0 - size.y / 2.0), size), 0);
     }
     if truncated {
         response.on_hover_text(details())
@@ -3278,6 +3356,123 @@ fn resize_rule(ui: &mut egui::Ui, height: &mut f32, range: std::ops::RangeInclus
     let color = if drag.hovered() || drag.dragged() { BEVEL } else { FOLD };
     ui.painter().hline(rule.x_range(), rule.center().y, egui::Stroke::new(1.0_f32, color));
     ui.painter().rect_filled(egui::Rect::from_center_size(rule.center(), Vec2::new(32.0, 5.0)), 3, color);
+}
+
+/// A tag's colour, the same on every run: muted inks that sit on the paper.
+fn tag_color(name: &str) -> Color32 {
+    const PALETTE: [Color32; 8] = [
+        Color32::from_rgb(176, 84, 52),
+        Color32::from_rgb(58, 110, 165),
+        Color32::from_rgb(61, 125, 82),
+        Color32::from_rgb(150, 92, 150),
+        Color32::from_rgb(184, 134, 30),
+        Color32::from_rgb(40, 128, 128),
+        Color32::from_rgb(160, 70, 90),
+        Color32::from_rgb(110, 112, 56),
+    ];
+    // FNV-1a: std's hasher is randomly seeded per run.
+    let hash = name.to_lowercase().bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193));
+    PALETTE[hash as usize % PALETTE.len()]
+}
+
+/// A tag pill laid out for painting: colour dot, name, and an optional count or ×.
+struct Pill {
+    name: Arc<egui::Galley>,
+    extra: Option<Arc<egui::Galley>>,
+    color: Color32,
+}
+impl Pill {
+    fn new(painter: &egui::Painter, name: &str, extra: Option<&str>, max_width: f32) -> Self {
+        Self {
+            name: card_text(painter, name, 12.0, INK, max_width, 1),
+            extra: extra.map(|text| card_text(painter, text, 11.0, MUTED, 60.0, 1)),
+            color: tag_color(name),
+        }
+    }
+    fn size(&self) -> Vec2 {
+        Vec2::new(22.0 + self.name.size().x + self.extra.as_ref().map_or(0.0, |e| e.size().x + 6.0) + 9.0, 22.0)
+    }
+    /// `emphasis`: 0 resting, 1 hovered, 2 selected.
+    fn paint(self, painter: &egui::Painter, rect: egui::Rect, emphasis: u8) {
+        let fill = self.color.gamma_multiply([0.13, 0.22, 0.34][emphasis as usize]);
+        let stroke = if emphasis == 2 { egui::Stroke::new(1.0_f32, self.color) } else { egui::Stroke::new(1.0_f32, self.color.gamma_multiply(0.35)) };
+        painter.rect(rect, 11, fill, stroke, egui::StrokeKind::Inside);
+        painter.circle_filled(rect.left_center() + Vec2::new(11.0, 0.0), 3.5, self.color);
+        let text = rect.left_center() + Vec2::new(20.0, -self.name.size().y / 2.0);
+        let width = self.name.size().x;
+        painter.galley(text, self.name, INK);
+        if let Some(extra) = self.extra {
+            painter.galley(egui::pos2(text.x + width + 6.0, rect.center().y - extra.size().y / 2.0), extra, MUTED);
+        }
+    }
+}
+
+/// A clickable tag pill.
+fn tag_chip(ui: &mut egui::Ui, name: &str, extra: Option<&str>, selected: bool) -> egui::Response {
+    let pill = Pill::new(ui.painter(), name, extra, 180.0);
+    let (rect, response) = ui.allocate_exact_size(pill.size(), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, name));
+    let emphasis = if selected { 2 } else { u8::from(response.hovered()) };
+    pill.paint(ui.painter(), rect, emphasis);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The tags in `tags` as pills (click one to remove it) and a "+ Tag" menu to type a new tag or pick a known one; true when changed.
+fn tag_editor(ui: &mut egui::Ui, tags: &mut std::collections::BTreeSet<String>, known: &[(String, i64)], draft: &mut String, salt: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+        for name in tags.clone() {
+            if tag_chip(ui, &name, Some("×"), false).on_hover_text("Remove this tag").clicked() {
+                tags.remove(&name);
+                changed = true;
+            }
+        }
+        let button = egui::Button::new(RichText::new("+ Tag").size(12.0).color(MUTED)).corner_radius(11).min_size(Vec2::new(0.0, 22.0));
+        let menu = egui::containers::menu::MenuButton::from_button(button)
+            // Clicking into the name field must not close the menu.
+            .config(egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside));
+        let (button, _) = menu.ui(ui, |ui| {
+            ui.set_max_width(240.0);
+            let field = ui.add(egui::TextEdit::singleline(draft).id_salt(("tag-draft", salt)).hint_text("New tag, then Return").desired_width(220.0));
+            // Read Return before refocusing: lost_focus() reads focus as it is now, and refocusing would hide the loss.
+            let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.memory(|m| m.focused().is_none()) {
+                field.request_focus();
+            }
+            let typed = draft.trim().to_owned();
+            if submitted && !typed.is_empty() {
+                // Reuse an existing tag's spelling so "endgame" joins "Endgame".
+                let name = known.iter().find(|(k, _)| k.to_lowercase() == typed.to_lowercase()).map_or(typed.clone(), |(k, _)| k.clone());
+                changed |= tags.insert(name);
+                draft.clear();
+                ui.close();
+            }
+            let needle = typed.to_lowercase();
+            let offers: Vec<_> = known.iter().filter(|(k, _)| !tags.contains(k) && k.to_lowercase().contains(&needle)).collect();
+            if !offers.is_empty() {
+                ui.small(if needle.is_empty() { "Your tags" } else { "Matching tags" });
+                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                        for (name, games) in offers {
+                            if tag_chip(ui, name, Some(&games.to_string()), false).clicked() {
+                                tags.insert(name.clone());
+                                changed = true;
+                                draft.clear();
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        if button.clicked() {
+            // A fresh menu starts empty, not with a name half-typed into another tag menu.
+            draft.clear();
+        }
+    });
+    changed
 }
 
 fn saved_width(key: &NSString, default: f32) -> f32 {

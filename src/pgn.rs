@@ -36,6 +36,11 @@ pub struct Game {
     /// Side lines the reader promoted: parent node to the child that now continues it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub promoted: BTreeMap<usize, usize>,
+    /// The reader's tags on the whole game, and on single positions by move node.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub labels: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub position_labels: BTreeMap<usize, std::collections::BTreeSet<String>>,
     #[serde(skip)]
     bytes: usize,
 }
@@ -221,6 +226,7 @@ impl Game {
         self.drawings = std::mem::take(&mut self.drawings).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
         self.glyphs = std::mem::take(&mut self.glyphs).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
         self.bookmarks = std::mem::take(&mut self.bookmarks).into_iter().filter_map(remap).collect();
+        self.position_labels = std::mem::take(&mut self.position_labels).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
         self.promoted = std::mem::take(&mut self.promoted)
             .into_iter()
             .filter_map(|(p, c)| Some((remap(p)?, remap(c)?)))
@@ -727,6 +733,8 @@ mod tests {
         let d4 = play_san(&mut game, &mut replay, 0, "d4");
         let mut notes = Notes::from([(exd5, "gone".into()), (d4, "kept".into()), (2, "game".into())]);
         game.glyphs.insert(d4, 1);
+        game.position_labels.insert(d4, ["Gambit".to_owned()].into());
+        game.position_labels.insert(nc3, ["Gone".to_owned()].into());
         assert!(game.promote(&replay, nc3));
         assert!(!game.promote(&replay, d5), "the game's own move stays first");
         let replay = game.replay().unwrap();
@@ -738,6 +746,7 @@ mod tests {
         assert_eq!(replay.nodes[d5].san, "d4", "later added moves shift into the freed IDs");
         assert_eq!(notes, Notes::from([(2, "game".into()), (d5, "kept".into())]));
         assert_eq!(game.glyphs, BTreeMap::from([(d5, 1)]));
+        assert_eq!(game.position_labels.keys().copied().collect::<Vec<_>>(), vec![d5], "position tags follow their move");
         assert!(game.promoted.is_empty());
         assert!(!game.export(&notes).unwrap().contains("d5"));
     }

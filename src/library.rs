@@ -35,7 +35,11 @@ pub fn open(path: &Path) -> Result<Connection> {
           INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text);
           INSERT INTO games_fts(rowid,search_text) VALUES(new.id,new.search_text); END;
         CREATE TRIGGER IF NOT EXISTS games_ad AFTER DELETE ON games BEGIN
-          INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text); END;")?;
+          INSERT INTO games_fts(games_fts,rowid,search_text) VALUES('delete',old.id,old.search_text); END;
+        -- Tags on a game (node NULL) or one of its positions; an index of the game JSON, rewritten by save().
+        CREATE TABLE IF NOT EXISTS labels (game INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE, node INTEGER, name TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS labels_name ON labels(name, game);
+        CREATE INDEX IF NOT EXISTS labels_game ON labels(game);")?;
     // Nested folders; each game sits in at most one. Checks the column, not user_version, which older builds reset to 1.
     if db.query_row("SELECT count(*) FROM pragma_table_info('games') WHERE name='folder'", [], |r| r.get::<_, i64>(0))? == 0 {
         db.execute_batch("BEGIN;
@@ -57,6 +61,8 @@ pub struct Filter {
     pub event: Option<String>,
     /// Only games in this folder or its subfolders; None for any.
     pub folder: Option<i64>,
+    /// Only games with this tag on the game or any of its positions; None for any.
+    pub tag: Option<String>,
 }
 impl Filter {
     fn fts(&self) -> String {
@@ -70,7 +76,8 @@ impl Filter {
     fn clause(&self) -> String {
         format!(
             "WHERE (?1 = '' OR source = ?1) AND (?2 = 0 OR starred = 1) AND (?4 IS NULL OR event = ?4)
-            AND (?5 IS NULL OR folder IN (WITH RECURSIVE t(id) AS (SELECT ?5 UNION ALL SELECT f.id FROM folders f JOIN t ON f.parent = t.id) SELECT id FROM t)) {}",
+            AND (?5 IS NULL OR folder IN (WITH RECURSIVE t(id) AS (SELECT ?5 UNION ALL SELECT f.id FROM folders f JOIN t ON f.parent = t.id) SELECT id FROM t))
+            AND (?6 IS NULL OR id IN (SELECT game FROM labels WHERE name = ?6)) {}",
             if self.fts().is_empty() {
                 "AND ?3 = ''"
             } else {
@@ -89,6 +96,8 @@ pub struct Row {
     pub result: String,
     pub eco: String,
     pub starred: bool,
+    /// Every tag on the game and its positions, sorted; filled by search() only.
+    pub labels: Vec<String>,
 }
 pub struct Page {
     pub rows: Vec<Row>,
@@ -96,6 +105,8 @@ pub struct Page {
     pub all: i64,
     pub sources: Vec<(String, i64)>,
     pub folders: Vec<Folder>,
+    /// Every tag with the number of games carrying it, sorted by name.
+    pub labels: Vec<(String, i64)>,
     pub more: bool,
 }
 /// A folder with the number of games in it and all its subfolders; folders come sorted by name.
@@ -147,8 +158,8 @@ pub fn file_imported(db: &Connection, after: i64, folder: i64) -> Result<usize> 
 /// Moves one game, or with `id` None every game matching `filter`, into `folder` (None takes them out of folders).
 pub fn move_games(db: &Connection, filter: &Filter, id: Option<i64>, folder: Option<i64>) -> Result<usize> {
     Ok(db.execute(
-        &format!("UPDATE games SET folder=?7 {} AND (?6 IS NULL OR id=?6)", filter.clause()),
-        params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, id, folder],
+        &format!("UPDATE games SET folder=?8 {} AND (?7 IS NULL OR id=?7)", filter.clause()),
+        params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, filter.tag, id, folder],
     )?)
 }
 pub struct Loaded {
@@ -168,6 +179,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         result: r.get(5)?,
         eco: r.get(6)?,
         starred: r.get(7)?,
+        labels: Vec::new(),
     })
 }
 
@@ -194,11 +206,11 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
     let fts = filter.fts();
     let total = db.query_row(
         &format!("SELECT count(*) FROM games {clause}"),
-        params![filter.source, filter.starred, fts, filter.event, filter.folder],
+        params![filter.source, filter.starred, fts, filter.event, filter.folder, filter.tag],
         |r| r.get(0),
     )?;
     let all = db.query_row("SELECT count(*) FROM games", [], |r| r.get(0))?;
-    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?6 ORDER BY id DESC LIMIT ?7"))?;
+    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?7 ORDER BY id DESC LIMIT ?8"))?;
     let mut rows = stmt
         .query_map(
             params![
@@ -207,6 +219,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
                 fts,
                 filter.event,
                 filter.folder,
+                filter.tag,
                 before,
                 PAGE_SIZE as i64 + 1
             ],
@@ -215,6 +228,14 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let more = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
+    let mut names = db.prepare("SELECT DISTINCT name FROM labels WHERE game = ? ORDER BY name COLLATE NOCASE")?;
+    for row in &mut rows {
+        row.labels = names.query_map([row.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    }
+    let labels = db
+        .prepare("SELECT name, count(DISTINCT game) FROM labels GROUP BY name ORDER BY name COLLATE NOCASE")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let sources = db
         .prepare("SELECT source, count(*) FROM games GROUP BY source ORDER BY source")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -225,6 +246,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
         all,
         sources,
         folders: folders(db)?,
+        labels,
         more,
     })
 }
@@ -333,8 +355,9 @@ fn search_text(game: &Game, notes: &Notes) -> String {
     text
 }
 pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
     anyhow::ensure!(
-        db.execute(
+        tx.execute(
             "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8,event=?9 WHERE id=?4",
             params![
                 serde_json::to_string(&loaded.notes)?,
@@ -350,6 +373,18 @@ pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
         )? == 1,
         "Game no longer exists"
     );
+    tx.execute("DELETE FROM labels WHERE game = ?", [loaded.id])?;
+    let mut insert = tx.prepare("INSERT INTO labels(game, node, name) VALUES(?, ?, ?)")?;
+    for name in &loaded.game.labels {
+        insert.execute(params![loaded.id, None::<i64>, name])?;
+    }
+    for (node, names) in &loaded.game.position_labels {
+        for name in names {
+            insert.execute(params![loaded.id, *node as i64, name])?;
+        }
+    }
+    drop(insert);
+    tx.commit()?;
     Ok(())
 }
 
@@ -425,10 +460,10 @@ pub fn export(db: &Connection, filter: &Filter, id: Option<i64>, path: &Path) ->
     let result = (|| -> Result<u64> {
         let mut out = BufWriter::new(file);
         let mut stmt = db.prepare(&format!(
-            "SELECT body,notes FROM games {} AND (?6 IS NULL OR id=?6) ORDER BY id",
+            "SELECT body,notes FROM games {} AND (?7 IS NULL OR id=?7) ORDER BY id",
             filter.clause()
         ))?;
-        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, id])?;
+        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, filter.tag, id])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
             let game: Game = serde_json::from_str(&row.get::<_, String>(0)?)?;
@@ -558,6 +593,36 @@ mod tests {
         assert_eq!(search(&db, &Filter::default(), i64::MAX).unwrap().all, 3);
         drop(db);
         assert_eq!(open(&dir.path().join("db")).unwrap().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    }
+    #[test]
+    fn tags_on_games_and_positions_filter_and_follow_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir.path().join("db")).unwrap();
+        let pgn = dir.path().join("input.pgn");
+        std::fs::write(&pgn, "[White \"Tal\"]\n\n1. e4 e5 *\n\n[White \"Carlsen\"]\n\n1. d4 *").unwrap();
+        import(&mut db, &[pgn], &AtomicBool::new(false), |_| {}).unwrap();
+        let id = |name: &str| search(&db, &Filter { query: name.into(), ..Default::default() }, i64::MAX).unwrap().rows[0].id;
+        let (tal, carlsen) = (id("Tal"), id("Carlsen"));
+        let mut game = load(&db, tal).unwrap();
+        game.game.labels.insert("Attack".into());
+        game.game.position_labels.insert(2, ["Open game".into(), "Attack".into()].into());
+        save(&db, &game).unwrap();
+        let mut other = load(&db, carlsen).unwrap();
+        other.game.position_labels.insert(1, ["Open game".into()].into());
+        save(&db, &other).unwrap();
+        let tagged = |tag: &str| search(&db, &Filter { tag: Some(tag.into()), ..Default::default() }, i64::MAX).unwrap();
+        assert_eq!(tagged("Attack").total, 1, "a game counts once however many of its positions carry the tag");
+        assert_eq!(tagged("Open game").total, 2);
+        let page = tagged("Attack");
+        assert_eq!(page.labels, vec![("Attack".into(), 1), ("Open game".into(), 2)]);
+        assert_eq!(page.rows[0].labels, vec!["Attack", "Open game"]);
+        assert_eq!(load(&db, tal).unwrap().game.position_labels[&2].len(), 2, "tags round-trip through the game JSON");
+        game.game.labels.clear();
+        game.game.position_labels.clear();
+        save(&db, &game).unwrap();
+        assert_eq!(tagged("Attack").total, 0, "removed tags leave the index");
+        delete(&db, carlsen).unwrap();
+        assert!(tagged("Open game").labels.is_empty(), "deleting a game drops its tags");
     }
     #[test]
     fn failed_export_preserves_existing_destination() {
