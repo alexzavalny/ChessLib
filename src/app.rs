@@ -56,6 +56,16 @@ struct Train {
     revealed: bool,
 }
 
+/// The library's file name inside its folder.
+pub const LIBRARY_FILE: &str = "library.sqlite3";
+
+/// The folder chosen with "Library folder…", if any.
+pub fn saved_library_folder() -> Option<PathBuf> {
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(ns_string!("LibraryFolder"))
+        .map(|folder| PathBuf::from(folder.to_string()))
+}
+
 #[derive(Clone, Copy)]
 enum FolderEdit {
     New(Option<i64>),
@@ -75,6 +85,8 @@ pub struct App {
     collapsed: HashSet<i64>,
     /// The folder open when the running import started; its new games are filed there.
     import_folder: Option<i64>,
+    /// Another library folder was chosen: start a new app on it once this window has saved and closes.
+    relaunch: bool,
     train_player: String,
     /// The Cmd+P "Jump to game" query, its matches and the highlighted match.
     jump: Option<(String, Vec<library::Row>, usize)>,
@@ -252,6 +264,7 @@ impl App {
             folder_edit: None,
             collapsed: HashSet::new(),
             import_folder: None,
+            relaunch: false,
             train_player: String::new(),
             jump: None,
             event_list: None,
@@ -522,6 +535,33 @@ impl App {
         }
         self.refresh(false);
     }
+    /// Switches to the library in a chosen folder: remembers it, then quits so main() reopens the app on it.
+    fn choose_library_folder(&mut self, ctx: &egui::Context) {
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("Choose the folder for your library")
+            .set_directory(self.path.parent().unwrap_or(&self.path))
+            .pick_folder()
+        else {
+            return;
+        };
+        let path = folder.join(LIBRARY_FILE);
+        if path == self.path {
+            return;
+        }
+        // Opening creates or upgrades the library, so a folder that cannot hold one fails here, not after the restart.
+        if let Err(e) = library::open(&path) {
+            self.error = Some(format!("Cannot use {} as a library: {e}", path.display()));
+            return;
+        }
+        // SAFETY: an NSString is a property-list value, which is all user defaults require.
+        unsafe {
+            NSUserDefaults::standardUserDefaults()
+                .setObject_forKey(Some(&NSString::from_str(&folder.to_string_lossy())), ns_string!("LibraryFolder"));
+        }
+        self.relaunch = true;
+        self.status = format!("Reopening on {}", path.display());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
     fn import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         if paths.is_empty() || self.importing || !self.save() {
             return;
@@ -683,12 +723,17 @@ impl App {
                     ui.painter().vline(rect.right() - 0.5 - i as f32, rect.y_range(), egui::Stroke::new(1.0_f32, Color32::from_black_alpha(alpha)));
                 }
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("YOUR LIBRARY")
-                        .size(11.0)
-                        .strong()
-                        .color(GREEN),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("YOUR LIBRARY").size(11.0).strong().color(GREEN));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button = ui
+                            .add_enabled(!self.importing && !self.exporting, egui::Button::new(RichText::new("Library folder…").small()))
+                            .on_hover_text(format!("{}\n\nOpen the library in another folder, or start a new one there. This library stays where it is.", self.path.display()));
+                        if button.clicked() {
+                            self.choose_library_folder(ctx);
+                        }
+                    });
+                });
                 ui.horizontal(|ui| {
                     ui.heading("Games");
                     if let Some(page) = &self.page {
@@ -1868,18 +1913,17 @@ impl App {
             let mut clicked = None;
             let mut dragged = None;
             let mut drop = false;
-            // Atlas cell and lift; shorter pieces sit low in the atlas because the bases share a baseline.
             let piece_uv = |piece: shakmaty::Piece| {
-                let (column, lift) = match piece.role {
-                    Role::King => (0, 0.0),
-                    Role::Queen => (1, 0.04),
-                    Role::Bishop => (2, 0.0),
-                    Role::Knight => (3, 0.05),
-                    Role::Rook => (4, 0.07),
-                    Role::Pawn => (5, 0.09),
+                let column = match piece.role {
+                    Role::King => 0,
+                    Role::Queen => 1,
+                    Role::Bishop => 2,
+                    Role::Knight => 3,
+                    Role::Rook => 4,
+                    Role::Pawn => 5,
                 };
                 let top = if piece.color == Color::White { 0.0 } else { 0.5 };
-                (egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5)), lift)
+                egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5))
             };
             let square_at = |p: egui::Pos2| {
                 let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
@@ -1901,8 +1945,7 @@ impl App {
                 origin + Vec2::new((col as f32 + 0.5) * cell, (row as f32 + 0.5) * cell)
             };
             let draw_piece = |piece: shakmaty::Piece, at: egui::Pos2| {
-                let (uv, lift) = piece_uv(piece);
-                painter.image(self.piece_art.id(), egui::Rect::from_center_size(at, Vec2::splat(cell)).translate(Vec2::new(0.0, -cell * lift)), uv, Color32::WHITE);
+                painter.image(self.piece_art.id(), egui::Rect::from_center_size(at, Vec2::splat(cell)), piece_uv(piece), Color32::WHITE);
             };
             // Each piece that arrived on a square glides from the nearest square it left.
             const SLIDE: f32 = 0.2;
@@ -2203,6 +2246,15 @@ impl eframe::App for App {
             }
             if self.exporting {
                 self.status = "Finishing export. Close again when complete.".into();
+            }
+        } else if ctx.input(|i| i.viewport().close_requested()) && self.relaunch {
+            // Saved above, so the new app can open its library; CHESSLIB_DB would override the chosen folder.
+            let spawned = std::env::current_exe()
+                .and_then(|exe| std::process::Command::new(exe).env_remove("CHESSLIB_DB").spawn());
+            if let Err(e) = spawned {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.relaunch = false;
+                self.error = Some(format!("The library folder is saved, but ChessLib could not restart: {e}. Quit and open it again."));
             }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {

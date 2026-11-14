@@ -27,6 +27,8 @@ Import your PGNs, play through the positions that matter, and keep your notes al
    sh scripts/bundle-macos.sh
    ```
 
+   To build it and install it as `/Applications/ChessLib.app` (replacing an older copy; your library is kept), run `sh scripts/install-macos.sh` instead.
+
 2. **Add a game.** Choose **Try a sample game** to load the Opera Game, or use **Import PGN** (⌘O) to bring in your own files.
 3. **Study a position.** Select a game, step through it with the arrow keys, then play an alternative on the board or jot down a note. Variations and notes save automatically.
 
@@ -96,7 +98,7 @@ ChessLib reports **approximate accuracy** as the arithmetic mean of that side's 
 <details>
 <summary>Local storage, backups and large collections</summary>
 
-The default database is `~/Library/Application Support/ChessLib/library.sqlite3`. `CHESSLIB_DB=/absolute/path/library.sqlite3` overrides it for development or a separate library.
+The default database is `~/Library/Application Support/ChessLib/library.sqlite3`. **Library folder…** at the top of the sidebar (hover it to see the current file) chooses another folder: ChessLib opens the `library.sqlite3` in it, or starts a new library there, remembers the choice, and restarts on it. It does not move or copy the current library; to move one, quit the app and move `library.sqlite3` together with any `-wal` and `-shm` files beside it, then choose the new folder. `CHESSLIB_DB=/absolute/path/library.sqlite3` overrides both for development or a separate library. Avoid folders that sync while the app is open (iCloud Drive, Dropbox): syncing a live SQLite database can corrupt it.
 
 PGN input is streamed one game at a time. SQLite commits batches of 200 games, uses WAL, and indexes full-text search with FTS5. The GUI holds 80 result rows and the selected game; it does not load the entire library. Pagination uses an ID cursor instead of increasingly expensive offsets. Search, imports, loading, and export run off the UI thread. Note writes are synchronous and may briefly wait for an import transaction.
 
