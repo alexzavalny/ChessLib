@@ -98,7 +98,7 @@ pub struct App {
     import_floor: i64,
     /// Imported games still missing details, and the one being filled in (White, Black, Event, Date; true when opened by Edit…).
     missing: Vec<i64>,
-    details: Option<(Loaded, [String; 4], bool)>,
+    details: Option<(Loaded, [String; 5], bool)>,
     db: rusqlite::Connection,
     path: PathBuf,
     requests: mpsc::Sender<Request>,
@@ -154,6 +154,8 @@ pub struct App {
     status: String,
     error: Option<String>,
     importing: bool,
+    /// Open the newest game when the running import finishes (set by Save to library).
+    open_imported: bool,
     exporting: bool,
     progress: ImportStats,
     cancel: Arc<AtomicBool>,
@@ -215,6 +217,10 @@ impl App {
                 .or_default()
                 .push("symbols".into());
         }
+        // Ubuntu Bold matches egui's Ubuntu Light; the rest of the proportional stack stays as fallback.
+        fonts.font_data.insert("bold".into(), egui::FontData::from_static(include_bytes!("../assets/Ubuntu-Bold.ttf")).into());
+        let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+        fonts.families.insert(egui::FontFamily::Name("bold".into()), [vec!["bold".into()], fallback].concat());
         ctx.set_fonts(fonts);
         let icon = image::load_from_memory_with_format(
             include_bytes!("../assets/header-icon.png"),
@@ -333,6 +339,7 @@ impl App {
             status: "Your chess, thoughtfully organised.".into(),
             error: None,
             importing: false,
+            open_imported: false,
             exporting: false,
             progress: ImportStats::default(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -361,7 +368,8 @@ impl App {
         self.search_due = None;
     }
     fn save(&mut self) -> bool {
-        if self.play.is_some() {
+        // Play games and the analysis board (id -1) are not library rows.
+        if self.play.is_some() || self.loaded.as_ref().is_some_and(|l| l.id < 0) {
             self.dirty = false;
             return true;
         }
@@ -431,7 +439,7 @@ impl App {
                     let v = loaded.game.tag(key);
                     if v.is_empty() || v.starts_with('?') { String::new() } else { v.to_owned() }
                 };
-                let fields = [known("White"), known("Black"), known("Event"), known("Date")];
+                let fields = [known("Title"), known("White"), known("Black"), known("Event"), known("Date")];
                 self.details = Some((loaded, fields, editing));
             }
             Err(e) => self.error = Some(format!("Could not open game: {e}")),
@@ -700,6 +708,13 @@ impl App {
                     }
                     self.missing = library::missing_details(&self.db, self.import_floor).unwrap_or_default();
                     self.refresh(true);
+                    // A duplicate adds nothing, so the board stays open.
+                    if std::mem::take(&mut self.open_imported)
+                        && let Ok(id) = library::last_id(&self.db)
+                        && id > self.import_floor
+                    {
+                        self.select(id);
+                    }
                 }
                 Event::Exported(result) => {
                     self.exporting = false;
@@ -833,10 +848,14 @@ impl App {
                 }
                 let folders = self.page.as_ref().map(|p| p.folders.clone()).unwrap_or_default();
                 self.folder_tree(ui, &folders);
-                let labels = self.page.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
+                let all_labels = self.page.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
+                // Tags with no games in this folder are hidden, unless selected so they can be cleared.
+                let labels: Vec<_> = all_labels.iter().filter(|(name, games)| *games > 0 || self.filter.tag.as_ref() == Some(name)).cloned().collect();
                 ui.label(RichText::new("TAGS").size(11.0).strong().color(GREEN));
-                if labels.is_empty() {
+                if all_labels.is_empty() {
                     ui.small("Tag a game under its title, or a position under its notes.");
+                } else if labels.is_empty() {
+                    ui.small("No tagged games in this folder.");
                 }
                 let mut chosen = None;
                 egui::ScrollArea::vertical().id_salt("tags").max_height(84.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -957,7 +976,8 @@ impl App {
                                     .clicked()
                                 {
                                     let name = |s: &str| if s.is_empty() { "?".to_owned() } else { s.to_owned() };
-                                    self.delete_game = Some((row.id, format!("{}  —  {}", name(&row.white), name(&row.black))));
+                                    let label = if row.title.is_empty() { format!("{}  —  {}", name(&row.white), name(&row.black)) } else { row.title.clone() };
+                                    self.delete_game = Some((row.id, label));
                                     ui.close();
                                 }
                             });
@@ -1030,6 +1050,46 @@ impl App {
         self.show_scratch(game, position.as_ref());
         self.flipped = settings.human == Color::Black;
         self.play = Some(Play { settings, job: None, error: None, stash, train: None });
+    }
+
+    /// An unsaved board at the start position, shown whenever no game is open.
+    /// Unknown tags stay empty so saving it asks for the game's details.
+    fn show_analysis_board(&mut self, position: Option<&shakmaty::Chess>) {
+        let mut game = Game::default();
+        game.tags = vec![("Result".into(), "*".into())];
+        self.show_scratch(game, position);
+        self.flipped = position.is_some_and(|p| p.turn() == Color::Black);
+    }
+
+    /// Leaves the open game (saving its edits) for a fresh analysis board.
+    fn new_board(&mut self) {
+        if !self.save() {
+            return;
+        }
+        // Drop any library game still loading so it cannot replace the new board.
+        self.load_seq += 1;
+        self.loading = false;
+        self.show_analysis_board(None);
+    }
+
+    /// Imports the analysis board as a new library game, then opens it.
+    fn save_analysis(&mut self, ctx: &egui::Context) {
+        let Some(loaded) = &self.loaded else { return };
+        let pgn = match loaded.game.export_as_game(&loaded.notes) {
+            Ok(pgn) => pgn,
+            Err(e) => {
+                self.error = Some(format!("Could not save the board: {e}"));
+                return;
+            }
+        };
+        let path = std::env::temp_dir().join("chesslib-board.pgn");
+        match std::fs::write(&path, pgn) {
+            Ok(()) => {
+                self.import_files(vec![path], ctx);
+                self.open_imported = self.importing;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
     /// Shows an unsaved game starting from `position` (the standard start when None).
@@ -1871,36 +1931,36 @@ impl App {
             material(ui.painter(), &cloth, desk, PAPER, 300.0);
             top_shadow(ui.painter(), desk, 10);
             if self.loaded.is_none() {
-                ui.add_space(60.0);
-                ui.label(RichText::new("Every game has\nsomething to teach.").size(34.0).strong());
-                ui.add_space(16.0); ui.label("Bring your games together. Revisit the critical\npositions. Keep your thinking alongside the moves.");
-                ui.add_space(24.0);
-                if ui.add(egui::Button::new(RichText::new("Import PGN files").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT))).clicked() { self.choose_import(ctx); }
-                if ui.button("Try a sample game").clicked() {
-                    let path = std::env::temp_dir().join("chesslib-sample.pgn");
-                    match std::fs::write(&path,include_str!("../fixtures/sample.pgn")) { Ok(()) => self.import_files(vec![path],ctx), Err(e) => self.error=Some(e.to_string()) }
-                }
-                ui.add_space(24.0); ui.small("Drag PGN files into this window · ⌘O to import\nYour library stays on this Mac.");
                 return;
             }
             let loaded = self.loaded.as_ref().unwrap();
-            let title = format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black"));
+            let title = if loaded.id < 0 { "Analysis board".into() } else if !loaded.game.tag("Title").is_empty() { loaded.game.tag("Title").to_owned() } else { format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black")) };
             let subtitle = match &self.play {
                 Some(play) if play.train.is_some() => "Train on mistakes  ·  find the better move".into(),
                 Some(play) => format!("Play vs computer  ·  you play {}", if play.settings.human == Color::White { "White" } else { "Black" }),
-                None => format!("{}  ·  {}  ·  {}",loaded.game.tag("Event"),loaded.game.tag("Date"),loaded.game.tag("Result")),
+                None if loaded.id < 0 => "Not saved to the library  ·  paste a FEN (⌘V) to set up a position".into(),
+                None => workspace_subtitle(&loaded.game),
             };
             ui.label(RichText::new("GAME WORKSPACE").size(11.0).strong().color(GREEN));
+            let saved = loaded.id >= 0;
             ui.horizontal(|ui| {
                 ui.heading(title);
                 let starred = self.loaded.as_ref().unwrap().starred;
-                if self.play.is_none() && ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
+                if self.play.is_none() && !saved && ui.button("Save to library").clicked() {
+                    self.save_analysis(ctx);
+                }
+                if self.play.is_none() && saved && ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
                     let loaded = self.loaded.as_mut().unwrap(); loaded.starred = !loaded.starred; self.dirty=true; self.edited=Instant::now();
                     if self.save() { self.refresh(false); }
                 }
+                if self.play.is_none() && ui.button("New board").on_hover_text("A fresh, unsaved board (⌘N)").clicked() {
+                    self.new_board();
+                }
             });
-            ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
-            if self.play.is_none() {
+            if !subtitle.is_empty() {
+                ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
+            }
+            if self.play.is_none() && saved {
                 let known = self.page.as_ref().map(|p| p.labels.as_slice()).unwrap_or_default();
                 let loaded = self.loaded.as_mut().unwrap();
                 if tag_editor(ui, &mut loaded.game.labels, known, &mut self.tag_draft, "game") {
@@ -2321,6 +2381,9 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.choose_import(ctx);
         }
+        if self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.new_board();
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
@@ -2378,7 +2441,7 @@ impl eframe::App for App {
         if !drops.is_empty() {
             self.import_files(drops, ctx);
         }
-        // ⌘V outside a text field imports pasted PGN; the importer reads files, so stage it in one.
+        // ⌘V outside a text field imports pasted PGN or FEN (a FEN on the analysis board sets it up instead); the importer reads files, so stage it in one.
         let pasted = if ctx.wants_keyboard_input() || self.importing { None } else {
             ctx.input(|i| i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) if !text.trim().is_empty() => Some(text.clone()),
@@ -2386,8 +2449,18 @@ impl eframe::App for App {
             }))
         };
         if let Some(text) = pasted {
-            let path = std::env::temp_dir().join("chesslib-paste.pgn");
-            match std::fs::write(&path, text) { Ok(()) => self.import_files(vec![path], ctx), Err(e) => self.error = Some(e.to_string()) }
+            let on_board = self.play.is_none() && self.loaded.as_ref().is_some_and(|l| l.id < 0);
+            match text.trim().parse::<Fen>() {
+                // On the analysis board a FEN sets up the position; save it from there if it is worth keeping.
+                Ok(fen) if on_board => match fen.into_position(shakmaty::CastlingMode::Standard) {
+                    Ok(position) => self.show_analysis_board(Some(&position)),
+                    Err(e) => self.error = Some(format!("That FEN is not a legal position: {e}")),
+                },
+                _ => {
+                    let path = std::env::temp_dir().join("chesslib-paste.pgn");
+                    match std::fs::write(&path, pasted_pgn(text)) { Ok(()) => self.import_files(vec![path], ctx), Err(e) => self.error = Some(e.to_string()) }
+                }
+            }
         }
         let cloth = self.bookcloth.clone();
         egui::TopBottomPanel::top("toolbar")
@@ -2503,6 +2576,9 @@ impl eframe::App for App {
             });
         if self.play.is_none() {
             self.sidebar(ctx);
+        }
+        if self.loaded.is_none() && self.play.is_none() {
+            self.show_analysis_board(None);
         }
         self.notebook(ctx);
         self.position_changed();
@@ -2670,7 +2746,7 @@ impl eframe::App for App {
                     let response = ui
                         .add_sized(
                             [ui.available_width(), 30.0],
-                            egui::Button::new(format!("{}  —  {}   · {}", row.white, row.black, row.date))
+                            egui::Button::new(if row.title.is_empty() { format!("{}  —  {}   · {}", row.white, row.black, row.date) } else { format!("{}   · {}", row.title, row.date) })
                                 .truncate()
                                 .selected(i == *highlight)
                                 .frame(i == *highlight),
@@ -2705,7 +2781,7 @@ impl eframe::App for App {
                 }
                 ui.add_space(8.0);
                 egui::Grid::new("details_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    for (field, (label, hint)) in fields.iter_mut().zip([("White", "Player name"), ("Black", "Player name"), ("Event", "Tournament or match"), ("Date", "YYYY.MM.DD")]) {
+                    for (field, (label, hint)) in fields.iter_mut().zip([("Title", "Optional, e.g. Bird trap line"), ("White", "Player name"), ("Black", "Player name"), ("Event", "Tournament or match"), ("Date", "YYYY.MM.DD")]) {
                         ui.label(label);
                         ui.add(egui::TextEdit::singleline(field).hint_text(hint).desired_width(280.0));
                         ui.end_row();
@@ -2719,7 +2795,12 @@ impl eframe::App for App {
                 });
             });
             if save {
-                // Blank stays unknown, in PGN's own spelling.
+                // Blank stays unknown, in PGN's own spelling; a blank title is no tag at all.
+                let [title, fields @ ..] = &*fields;
+                loaded.game.tags.retain(|(k, _)| k != "Title");
+                if !title.trim().is_empty() {
+                    loaded.game.set_tag("Title", title.trim().into());
+                }
                 for ((key, unknown), value) in [("White", "?"), ("Black", "?"), ("Event", "?"), ("Date", "????.??.??")].into_iter().zip(fields.iter()) {
                     let value = value.trim();
                     let value = if key == "Date" { value.replace(['-', '/'], ".") } else { value.to_owned() };
@@ -3113,10 +3194,18 @@ fn card_text(
     max_width: f32,
     max_rows: usize,
 ) -> Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::single_section(
-        text.to_owned(),
-        egui::TextFormat::simple(egui::FontId::proportional(size), color),
-    );
+    card_text_in(painter, text, egui::FontId::proportional(size), color, max_width, max_rows)
+}
+
+fn card_text_in(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+    max_rows: usize,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, color));
     job.wrap.max_width = max_width;
     job.wrap.max_rows = max_rows;
     job.break_on_newline = false;
@@ -3178,7 +3267,12 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
     } else {
         &row.black
     };
+    // A titled line or position leads with its title; players and event follow only when known.
+    let known = |s: &str| !s.trim_matches([' ', '?']).is_empty();
+    let titled = !row.title.is_empty();
+    let show_names = !titled || known(&row.white) || known(&row.black);
     let event = event_name(&row.event);
+    let show_result = !row.result.is_empty() && row.result != "*";
     let date = pretty_date(&row.date);
     let metadata = [date.as_deref(), Some(row.eco.as_str())]
         .into_iter()
@@ -3191,17 +3285,24 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
     let layout = |text, size, color, max_width, max_rows| {
         card_text(&painter, text, size, color, max_width, max_rows)
     };
-    let event_line = layout(event, 11.5, MUTED, width - 26.0, 2);
+    let reserve = if row.starred { 20.0 } else { 0.0 } + if show_result { 63.0 } else { 0.0 };
+    let bold = egui::FontId::new(15.0, egui::FontFamily::Name("bold".into()));
+    let title_line = titled.then(|| card_text_in(&painter, &row.title, bold, INK, width - 26.0 - reserve, 2));
+    let event_line = (!titled || known(&row.event)).then(|| layout(event, 11.5, MUTED, width - 26.0, 2));
+    let title_height = title_line.as_ref().map_or(0.0, |g| g.size().y + 4.0);
+    let names_height = if show_names { 36.0 } else { 0.0 };
+    let event_height = event_line.as_ref().map_or(0.0, |g| g.size().y);
     let metadata_height = if metadata.is_empty() { 0.0 } else { 16.0 };
     let tags_height = if row.labels.is_empty() { 0.0 } else { 26.0 };
     let (_, rect) = ui.allocate_space(Vec2::new(
         width,
-        50.0 + event_line.size().y + metadata_height + tags_height,
+        14.0 + title_height + names_height + event_height + metadata_height + tags_height,
     ));
     let response = ui.interact(rect, ui.make_persistent_id(row.id), egui::Sense::click());
     let details = || {
         format!(
-            "{}White: {white}\nBlack: {black}\n{event}\n{metadata}\n{}{}",
+            "{}{}White: {white}\nBlack: {black}\n{event}\n{metadata}\n{}{}",
+            if titled { format!("{}\n", row.title) } else { String::new() },
             if row.starred { "Favourite\n" } else { "" },
             row.result,
             if row.labels.is_empty() { String::new() } else { format!("\nTags: {}", row.labels.join(", ")) },
@@ -3223,7 +3324,8 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
 
     let left = rect.left() + 13.0;
     let mut right = rect.right() - 13.0;
-    let matchup_y = rect.top() + 24.0;
+    // Star and result sit level with the title, or between the two names.
+    let matchup_y = rect.top() + if titled { 16.0 } else { 24.0 };
     if row.starred {
         painter.text(
             egui::pos2(right, matchup_y),
@@ -3234,26 +3336,40 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         );
         right -= 20.0;
     }
-    let mut truncated = event_line.elided;
-    if !row.result.is_empty() && row.result != "*" {
+    let mut truncated = event_line.as_ref().is_some_and(|g| g.elided) || title_line.as_ref().is_some_and(|g| g.elided);
+    if show_result {
         let score = layout(&row.result, 12.0, GREEN, 54.0, 1);
         truncated |= score.elided;
         let badge = paint_card_badge(&painter, egui::pos2(right, matchup_y), score, selected);
         right = badge.left() - 9.0;
     }
+    let mut y = rect.top() + 6.0;
+    if let Some(title) = title_line {
+        let height = title.size().y;
+        painter.galley(egui::pos2(left, y), title, INK);
+        y += height + 4.0;
+    }
+    let names_top = y;
+    if show_names {
+        y += 36.0;
+    }
     for (name, y, marker) in [
-        (white, matchup_y - 9.0, PAPER),
-        (black, matchup_y + 9.0, GREEN),
-    ] {
+        (white, names_top + 9.0, PAPER),
+        (black, names_top + 27.0, GREEN),
+    ]
+    .into_iter()
+    .filter(|_| show_names)
+    {
         let center = egui::pos2(left + 4.0, y);
         painter.circle(center, 3.4, marker, egui::Stroke::new(1.0_f32, CARD_SAGE));
         let name = layout(name, 13.5, INK, right - left - 16.0, 1);
         truncated |= name.elided;
         painter.galley(egui::pos2(left + 16.0, y - name.size().y / 2.0), name, INK);
     }
-    let event_pos = egui::pos2(left, rect.top() + 42.0);
-    let metadata_y = event_pos.y + event_line.size().y + 3.0;
-    painter.galley(event_pos, event_line, MUTED);
+    let metadata_y = y + event_line.as_ref().map_or(0.0, |g| g.size().y + 3.0);
+    if let Some(event_line) = event_line {
+        painter.galley(egui::pos2(left, y), event_line, MUTED);
+    }
     if !metadata.is_empty() {
         let line = layout(&metadata, 11.0, GREEN, width - 26.0, 1);
         truncated |= line.elided;
@@ -3281,6 +3397,28 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
     }
 }
 
+/// Event, date and result under the game's heading, leaving out what PGN marks unknown; a titled game adds its players.
+fn workspace_subtitle(game: &Game) -> String {
+    let known = |s: &str| !s.trim_matches([' ', '?']).is_empty();
+    let players = (!game.tag("Title").is_empty() && (known(game.tag("White")) || known(game.tag("Black"))))
+        .then(|| format!("{} — {}", game.tag("White"), game.tag("Black")));
+    let event = known(game.tag("Event")).then(|| game.tag("Event").to_owned());
+    let result = (!matches!(game.tag("Result"), "" | "*")).then(|| game.tag("Result").to_owned());
+    [players, event, pretty_date(game.tag("Date")), result].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
+}
+
+#[cfg(test)]
+#[test]
+fn subtitle_leaves_out_unknowns() {
+    let mut game = Game::default();
+    game.tags = vec![("Title".into(), "Bird trap".into()), ("White".into(), "?".into()), ("Black".into(), "?".into()), ("Event".into(), "?".into()), ("Date".into(), "????.??.??".into()), ("Result".into(), "*".into())];
+    assert_eq!(workspace_subtitle(&game), "");
+    game.set_tag("Event", "Blitz".into());
+    game.set_tag("Date", "2026.11.14".into());
+    game.set_tag("Result", "1-0".into());
+    assert_eq!(workspace_subtitle(&game), "Blitz  ·  14 Nov 2026  ·  1-0");
+}
+
 /// An event's display name; PGN leaves unknown events blank or "?".
 fn event_name(name: &str) -> &str {
     if name.trim_matches([' ', '?']).is_empty() { "(No event)" } else { name }
@@ -3298,6 +3436,23 @@ fn pretty_date(date: &str) -> Option<String> {
         (_, Some(month)) => format!("{} {year}", MONTHS[month - 1]),
         _ => year.to_string(),
     })
+}
+
+/// Pasted text as PGN: a bare FEN (a puzzle, say) becomes a game starting from that position.
+fn pasted_pgn(text: String) -> String {
+    match text.trim().parse::<Fen>() {
+        Ok(_) => format!("[SetUp \"1\"]\n[FEN \"{}\"]\n\n*\n", text.trim()),
+        Err(_) => text,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pasted_fen_becomes_a_game() {
+    let pgn = pasted_pgn(" 8/8/8/8/8/6k1/8/4K3 b - - 0 42\n".into());
+    let game = pgn_reader::Reader::new(pgn.as_bytes()).read_game(&mut crate::pgn::Parser).unwrap().unwrap().unwrap();
+    assert_eq!(game.tag("FEN"), "8/8/8/8/8/6k1/8/4K3 b - - 0 42");
+    assert_eq!(pasted_pgn("1. e4 e5 *".into()), "1. e4 e5 *");
 }
 
 #[cfg(test)]
@@ -3428,6 +3583,8 @@ fn tag_editor(ui: &mut egui::Ui, tags: &mut std::collections::BTreeSet<String>, 
                 changed = true;
             }
         }
+        // Pill height: the app-wide button padding would make it taller than the tags beside it.
+        ui.spacing_mut().button_padding = Vec2::new(9.0, 2.0);
         let button = egui::Button::new(RichText::new("+ Tag").size(12.0).color(MUTED)).corner_radius(11).min_size(Vec2::new(0.0, 22.0));
         let menu = egui::containers::menu::MenuButton::from_button(button)
             // Clicking into the name field must not close the menu.

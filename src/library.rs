@@ -48,6 +48,10 @@ pub fn open(path: &Path) -> Result<Connection> {
             CREATE INDEX games_folder_id ON games(folder, id);
             COMMIT;")?;
     }
+    // A title for lines and positions that are not games; the game body keeps it as a PGN "Title" tag.
+    if db.query_row("SELECT count(*) FROM pragma_table_info('games') WHERE name='title'", [], |r| r.get::<_, i64>(0))? == 0 {
+        db.execute_batch("ALTER TABLE games ADD COLUMN title TEXT NOT NULL DEFAULT '';")?;
+    }
     db.execute_batch("PRAGMA user_version=2;")?;
     Ok(db)
 }
@@ -89,6 +93,7 @@ impl Filter {
 #[derive(Clone)]
 pub struct Row {
     pub id: i64,
+    pub title: String,
     pub white: String,
     pub black: String,
     pub event: String,
@@ -179,6 +184,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         result: r.get(5)?,
         eco: r.get(6)?,
         starred: r.get(7)?,
+        title: r.get(8)?,
         labels: Vec::new(),
     })
 }
@@ -192,8 +198,8 @@ pub fn jump(db: &Connection, query: &str) -> Result<Vec<Row>> {
         .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
         .collect();
     let sql = format!(
-        "SELECT id, white, black, event, date, result, eco, starred FROM games WHERE 1 {} ORDER BY id DESC LIMIT 10",
-        " AND (white || ' ' || black) LIKE ? ESCAPE '\\'".repeat(words.len())
+        "SELECT id, white, black, event, date, result, eco, starred, title FROM games WHERE 1 {} ORDER BY id DESC LIMIT 10",
+        " AND (title || ' ' || white || ' ' || black) LIKE ? ESCAPE '\\'".repeat(words.len())
     );
     Ok(db
         .prepare(&sql)?
@@ -210,7 +216,7 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
         |r| r.get(0),
     )?;
     let all = db.query_row("SELECT count(*) FROM games", [], |r| r.get(0))?;
-    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred FROM games {clause} AND id < ?7 ORDER BY id DESC LIMIT ?8"))?;
+    let mut stmt = db.prepare(&format!("SELECT id, white, black, event, date, result, eco, starred, title FROM games {clause} AND id < ?7 ORDER BY id DESC LIMIT ?8"))?;
     let mut rows = stmt
         .query_map(
             params![
@@ -232,9 +238,14 @@ pub fn search(db: &Connection, filter: &Filter, before: i64) -> Result<Page> {
     for row in &mut rows {
         row.labels = names.query_map([row.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     }
+    // Every tag, counting only games in the selected folder and its subfolders; the tag menu offers them all.
     let labels = db
-        .prepare("SELECT name, count(DISTINCT game) FROM labels GROUP BY name ORDER BY name COLLATE NOCASE")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare(
+            "WITH RECURSIVE t(id) AS (SELECT ?1 UNION ALL SELECT f.id FROM folders f JOIN t ON f.parent = t.id)
+            SELECT l.name, count(DISTINCT CASE WHEN ?1 IS NULL OR g.folder IN (SELECT id FROM t) THEN l.game END)
+            FROM labels l JOIN games g ON g.id = l.game GROUP BY l.name ORDER BY l.name COLLATE NOCASE",
+        )?
+        .query_map([filter.folder], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let sources = db
         .prepare("SELECT source, count(*) FROM games GROUP BY source ORDER BY source")?
@@ -358,7 +369,7 @@ pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
     let tx = db.unchecked_transaction()?;
     anyhow::ensure!(
         tx.execute(
-            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8,event=?9 WHERE id=?4",
+            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8,event=?9,title=?10 WHERE id=?4",
             params![
                 serde_json::to_string(&loaded.notes)?,
                 loaded.starred,
@@ -368,7 +379,8 @@ pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
                 loaded.game.tag("White"),
                 loaded.game.tag("Black"),
                 loaded.game.tag("Date"),
-                loaded.game.tag("Event")
+                loaded.game.tag("Event"),
+                loaded.game.tag("Title")
             ]
         )? == 1,
         "Game no longer exists"
@@ -429,7 +441,7 @@ pub fn import(
                 let game = game?;
                 let body = serde_json::to_string(&game)?;
                 let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
-                let inserted = tx.execute("INSERT OR IGNORE INTO games(hash,white,black,event,date,result,eco,source,body,search_text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![hash,game.tag("White"),game.tag("Black"),game.tag("Event"),game.tag("Date"),game.tag("Result"),game.tag("ECO"),source,body,search_text(&game,&Notes::new())])?;
+                let inserted = tx.execute("INSERT OR IGNORE INTO games(hash,white,black,event,date,result,eco,source,body,search_text,title) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![hash,game.tag("White"),game.tag("Black"),game.tag("Event"),game.tag("Date"),game.tag("Result"),game.tag("ECO"),source,body,search_text(&game,&Notes::new()),game.tag("Title")])?;
                 batch.read += 1;
                 if inserted == 1 {
                     batch.imported += 1;
@@ -616,6 +628,14 @@ mod tests {
         let page = tagged("Attack");
         assert_eq!(page.labels, vec![("Attack".into(), 1), ("Open game".into(), 2)]);
         assert_eq!(page.rows[0].labels, vec!["Attack", "Open game"]);
+        let parent = create_folder(&db, None, "Openings").unwrap();
+        let child = create_folder(&db, Some(parent), "e4").unwrap();
+        move_games(&db, &Filter::default(), Some(tal), Some(child)).unwrap();
+        let in_folder = search(&db, &Filter { folder: Some(parent), ..Default::default() }, i64::MAX).unwrap();
+        assert_eq!(in_folder.labels, vec![("Attack".into(), 1), ("Open game".into(), 1)], "counts cover the folder and its subfolders");
+        let empty = create_folder(&db, None, "Empty").unwrap();
+        let none = search(&db, &Filter { folder: Some(empty), ..Default::default() }, i64::MAX).unwrap();
+        assert_eq!(none.labels, vec![("Attack".into(), 0), ("Open game".into(), 0)], "every tag stays listed");
         assert_eq!(load(&db, tal).unwrap().game.position_labels[&2].len(), 2, "tags round-trip through the game JSON");
         game.game.labels.clear();
         game.game.position_labels.clear();
@@ -750,6 +770,9 @@ mod tests {
         assert_eq!(missing_details(&db, 0).unwrap(), [missing[0]]);
         assert_eq!(jump(&db, "Magnus").unwrap()[0].date, "2024.03.01");
         assert_eq!(jump(&db, "Magnus").unwrap()[0].event, "Norway Chess");
+        dated.game.set_tag("Title", "Bird trap".into());
+        save(&db, &dated).unwrap();
+        assert_eq!(jump(&db, "trap").unwrap()[0].title, "Bird trap");
         dated.game.set_tag("White", "Carlsen".into());
         save(&db, &dated).unwrap();
         let names = |q| jump(&db, q).unwrap().into_iter().map(|r| r.white).collect::<Vec<_>>();

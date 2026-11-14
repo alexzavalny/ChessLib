@@ -285,8 +285,20 @@ impl Game {
     }
 
     pub fn export(&self, notes: &Notes) -> Result<String> {
+        self.write(notes, false)
+    }
+
+    /// PGN with the reader's own lines written as the game's moves, for a board that has no game of its own.
+    pub fn export_as_game(&self, notes: &Notes) -> Result<String> {
+        self.write(notes, true)
+    }
+
+    fn write(&self, notes: &Notes, as_game: bool) -> Result<String> {
         match self.replay() {
-            Ok(replay) => {
+            Ok(mut replay) => {
+                if as_game {
+                    replay.game_len = replay.nodes.len();
+                }
                 let mut out = String::new();
                 for (name, value) in &self.tags {
                     let value = value
@@ -801,6 +813,21 @@ mod tests {
         assert!(game.replay().is_err());
         assert!(game.export(&Notes::new()).is_err());
     }
+    #[test]
+    fn board_lines_export_as_game_moves() {
+        let mut game = parse("*");
+        let mut replay = game.replay().unwrap();
+        let mut at = 0;
+        for san in ["f4", "e5"] {
+            let position = replay.nodes[at].position.clone().unwrap();
+            let movement = san.parse::<ChessSan>().unwrap().san.to_move(&position).unwrap();
+            at = game.play(&mut replay, at, movement).unwrap();
+        }
+        assert!(game.export(&Notes::new()).unwrap().contains("( 1. f4"), "plain export keeps them as analysis");
+        let saved = parse(&game.export_as_game(&Notes::new()).unwrap());
+        assert_eq!(saved.mainline_positions().unwrap().len(), 3);
+    }
+
     #[test]
     fn whole_game_positions_exclude_study_and_reject_truncated_main_lines() {
         let mut game = parse("1. e4 e5 *");
