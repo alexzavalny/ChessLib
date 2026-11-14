@@ -460,7 +460,7 @@ impl App {
         if folders.is_empty() {
             ui.small("Make folders for openings, courses or your own games.");
         }
-        let tree = egui::ScrollArea::vertical().id_salt("folders").max_height(self.folders_height).auto_shrink([false, true]).show(ui, |ui| {
+        let tree = egui::ScrollArea::vertical().id_salt("folders").max_height(self.folders_height).auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (depth, folder) in folder_rows(folders, &self.collapsed) {
                 ui.horizontal(|ui| {
@@ -515,8 +515,8 @@ impl App {
                 });
             }
         });
-        // Dragging past the last folder would only leave a dead zone, so the tree's own height caps it.
-        let full = tree.content_size.y.max(40.0);
+        // The tree keeps the dragged height even past its last folder; tags and games keep at least 240pt below.
+        let full = (tree.inner_rect.height() + ui.available_height() - 240.0).max(40.0);
         resize_rule(ui, &mut self.folders_height, 40.0..=full, ns_string!("FoldersHeight"));
         match action {
             Some(Action::Select(id)) => {
