@@ -2743,10 +2743,15 @@ impl eframe::App for App {
                     ui.label("No matching games.");
                 }
                 for (i, row) in rows.iter().enumerate() {
+                    let name = if row.title.is_empty() { format!("{}  —  {}", row.white, row.black) } else { row.title.clone() };
+                    let label = match pretty_date(&row.date) {
+                        Some(date) => format!("{name}   · {date}"),
+                        None => name,
+                    };
                     let response = ui
                         .add_sized(
                             [ui.available_width(), 30.0],
-                            egui::Button::new(if row.title.is_empty() { format!("{}  —  {}   · {}", row.white, row.black, row.date) } else { format!("{}   · {}", row.title, row.date) })
+                            egui::Button::new(label)
                                 .truncate()
                                 .selected(i == *highlight)
                                 .frame(i == *highlight),
