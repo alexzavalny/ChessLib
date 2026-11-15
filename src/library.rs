@@ -387,7 +387,7 @@ pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
     let tx = db.unchecked_transaction()?;
     anyhow::ensure!(
         tx.execute(
-            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8,event=?9,title=?10 WHERE id=?4",
+            "UPDATE games SET notes=?1,starred=?2,search_text=?3,body=?5,white=?6,black=?7,date=?8,event=?9,title=?10,result=?11,eco=?12 WHERE id=?4",
             params![
                 serde_json::to_string(&loaded.notes)?,
                 loaded.starred,
@@ -398,7 +398,9 @@ pub fn save(db: &Connection, loaded: &Loaded) -> Result<()> {
                 loaded.game.tag("Black"),
                 loaded.game.tag("Date"),
                 loaded.game.tag("Event"),
-                loaded.game.tag("Title")
+                loaded.game.tag("Title"),
+                loaded.game.tag("Result"),
+                loaded.game.tag("ECO")
             ]
         )? == 1,
         "Game no longer exists"
@@ -479,6 +481,22 @@ pub fn import(
     Ok(stats)
 }
 
+/// Writes one game, or with `id` None every game matching `filter`, as PGN with the reader's notes.
+pub fn write_pgn(db: &Connection, filter: &Filter, id: Option<i64>, out: &mut impl Write) -> Result<u64> {
+    let mut stmt = db.prepare(&format!(
+        "SELECT body,notes FROM games {} AND (?7 IS NULL OR id=?7) ORDER BY id",
+        filter.clause()
+    ))?;
+    let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, filter.tag, id])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let game: Game = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let notes: Notes = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        out.write_all(game.export(&notes)?.as_bytes())?;
+        count += 1;
+    }
+    Ok(count)
+}
 pub fn export(db: &Connection, filter: &Filter, id: Option<i64>, path: &Path) -> Result<u64> {
     // Write beside the destination, then rename: a failed export cannot truncate an existing file.
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -489,18 +507,7 @@ pub fn export(db: &Connection, filter: &Filter, id: Option<i64>, path: &Path) ->
         .open(&temp)?;
     let result = (|| -> Result<u64> {
         let mut out = BufWriter::new(file);
-        let mut stmt = db.prepare(&format!(
-            "SELECT body,notes FROM games {} AND (?7 IS NULL OR id=?7) ORDER BY id",
-            filter.clause()
-        ))?;
-        let mut rows = stmt.query(params![filter.source, filter.starred, filter.fts(), filter.event, filter.folder, filter.tag, id])?;
-        let mut count = 0;
-        while let Some(row) = rows.next()? {
-            let game: Game = serde_json::from_str(&row.get::<_, String>(0)?)?;
-            let notes: Notes = serde_json::from_str(&row.get::<_, String>(1)?)?;
-            out.write_all(game.export(&notes)?.as_bytes())?;
-            count += 1;
-        }
+        let count = write_pgn(db, filter, id, &mut out)?;
         out.flush()?;
         out.get_ref().sync_all()?;
         std::fs::rename(&temp, path)?;

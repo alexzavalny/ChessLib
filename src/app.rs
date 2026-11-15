@@ -2974,16 +2974,8 @@ impl eframe::App for App {
                 });
             });
             if save {
-                // Blank stays unknown, in PGN's own spelling; a blank title is no tag at all.
-                let [title, fields @ ..] = &*fields;
-                loaded.game.tags.retain(|(k, _)| k != "Title");
-                if !title.trim().is_empty() {
-                    loaded.game.set_tag("Title", title.trim().into());
-                }
-                for ((key, unknown), value) in [("White", "?"), ("Black", "?"), ("Event", "?"), ("Date", "????.??.??")].into_iter().zip(fields.iter()) {
-                    let value = value.trim();
-                    let value = if key == "Date" { value.replace(['-', '/'], ".") } else { value.to_owned() };
-                    loaded.game.set_tag(key, if value.is_empty() { unknown.into() } else { value });
+                for (key, value) in ["Title", "White", "Black", "Event", "Date"].into_iter().zip(fields.iter()) {
+                    loaded.game.set_header(key, value);
                 }
                 match library::save(&self.db, loaded) {
                     Ok(()) => {
@@ -3726,7 +3718,7 @@ fn pretty_date(date: &str) -> Option<String> {
 }
 
 /// Pasted text as PGN: a bare FEN (a puzzle, say) becomes a game starting from that position.
-fn pasted_pgn(text: String) -> String {
+pub fn pasted_pgn(text: String) -> String {
     match text.trim().parse::<Fen>() {
         Ok(_) => format!("[SetUp \"1\"]\n[FEN \"{}\"]\n\n*\n", text.trim()),
         Err(_) => text,

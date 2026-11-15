@@ -69,6 +69,24 @@ impl Game {
         }
     }
 
+    /// Sets a header as the game editor does: dates take dots, and a blank value leaves PGN's
+    /// unknown spelling for White, Black, Event, Date and Result, or removes any other header.
+    pub fn set_header(&mut self, key: &str, value: &str) {
+        let value = value.trim();
+        let value = if key == "Date" { value.replace(['-', '/'], ".") } else { value.to_owned() };
+        let unknown = match key {
+            "White" | "Black" | "Event" => "?",
+            "Date" => "????.??.??",
+            "Result" => "*",
+            _ => "",
+        };
+        match (value.is_empty(), unknown.is_empty()) {
+            (true, true) => self.tags.retain(|(k, _)| k != key),
+            (true, false) => self.set_tag(key, unknown.into()),
+            _ => self.set_tag(key, value),
+        }
+    }
+
     pub fn initial(&self) -> Result<Chess> {
         anyhow::ensure!(
             matches!(self.tag("Variant"), "" | "Standard" | "Chess" | "Normal"),

@@ -115,12 +115,34 @@ For a complete backup, quit the app and copy the database. While the app is runn
 
 - Standard chess and legal FEN starting positions. Unsupported variants remain stored and exportable, with a display error. An illegal imported move disables that continuation with an explanation; other legal branches remain playable and the original tokens survive export.
 - Variations can be added, explored, promoted and (if you added them) deleted, with notes on each position. Deleting imported variations, replacing the game's own moves as the main line, and editing imported annotations are not included.
-- No opening tree, online sync, position search, or collection deletion. The game editor covers White, Black, Event and Date only. Position analysis supports one-shot and continuous modes. Full-game review covers the original main line; it does not classify study variations.
+- No opening tree, online sync, position search, or collection deletion. The app's game editor covers Title, White, Black, Event and Date only; `chesslib games set` edits any header except the starting position (FEN, SetUp, Variant). Position analysis supports one-shot and continuous modes. Full-game review covers the original main line; it does not classify study variations.
 - Notes are separate from original annotations. On export, braces in comments are replaced with parentheses because PGN brace comments cannot nest.
 - UTF-8 PGNs are supported; invalid byte sequences are replaced by the Unicode replacement character. Very long comments may be normalized into multiple comments. A single game is capped at 16 MiB of parsed content to bound accidental memory growth. Malformed PGNs should be checked against their originals; the PGN reader is permissive.
 - The build script signs the app ad hoc for local use.
 
 </details>
+
+## Command line for scripts and agents
+
+The app binary is also a command-line tool. With arguments, it works on the library instead of opening a window: importing and exporting PGN, listing and searching games, editing headers, favourites, folders, tags, notes, move marks, bookmarks, drawings and added variations. Analysis and play against Stockfish are app-only. Every command prints one line of JSON, except `games export` without `--out`, which prints PGN. Errors go to standard error with exit status 1. Flags a command does not take are rejected before anything changes.
+
+```sh
+CHESSLIB=/Applications/ChessLib.app/Contents/MacOS/chesslib
+$CHESSLIB help                                   # every command
+$CHESSLIB folders create "Najdorf" --parent 3    # {"id":7}
+$CHESSLIB games import course.pgn --to 7         # {"ids":[41,42],"imported":2,...}
+pbpaste | $CHESSLIB games import -               # PGN or a FEN from standard input
+$CHESSLIB games list --tag Endgame --folder 3    # 80 games, newest first; page with --before
+$CHESSLIB games show 41                          # headers, PGN and every position (node) with its FEN
+$CHESSLIB games play 41 12 Nf3 Nc6               # add a variation after node 12
+$CHESSLIB games note 41 13 "The point of the line"
+$CHESSLIB tags add 41 Sicilian
+$CHESSLIB games export --folder 3 --out najdorf.pgn
+```
+
+`$CHESSLIB library use ~/Chess/Openings` makes later commands open that library (a `library.sqlite3` file, or a folder holding one); `$CHESSLIB library use none` goes back to the app's library. It is remembered in `~/Library/Application Support/ChessLib/cli-library` and does not change the library the app opens. In order, a command opens `--db PATH`, then `CHESSLIB_DB`, then the library set with `library use`, then the app's library folder, then the default database. The app's library folder is read from the app's own settings, which a symlink to the binary cannot see: it opens the default database instead. Run the binary inside the app, use an alias or a script containing `exec /Applications/ChessLib.app/Contents/MacOS/chesslib "$@"`, or set the library once with `library use`. `chesslib library` shows which file a command uses.
+
+The app and the command line can run together. The app shows command-line changes when its list next refreshes. A game open in the app keeps the app's copy: if you edit that game in the app, its next save replaces the command-line edits.
 
 ## Development
 
