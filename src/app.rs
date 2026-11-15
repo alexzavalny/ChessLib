@@ -2152,7 +2152,10 @@ impl App {
             // Layout: evaluation bar, a gap, then the clothbound cover with a 22px binding margin
             // that carries the coordinates around the squares.
             const BIND: f32 = 22.0;
-            let side = (ui.available_width()-64.0-BIND).min(ui.available_height()-125.0-2.0*BIND).max(240.0);
+            // Room below for the controls row, plus the review graph or its hint line when shown.
+            let has_review = self.loaded.as_ref().is_some_and(|l| l.game.review.is_some());
+            let reserve = if has_review { 125.0 } else if self.play.is_some() { 52.0 } else { 75.0 };
+            let side = (ui.available_width()-64.0-BIND).min(ui.available_height()-reserve-2.0*BIND).max(240.0);
             let cell = side/8.0;
             // Centre the squares in the desk; the evaluation bar hangs to their left, so a narrow window
             // shifts the board right just enough to keep the bar on screen.
