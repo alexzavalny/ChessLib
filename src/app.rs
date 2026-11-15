@@ -1,7 +1,7 @@
 use crate::{
     engine,
     library::{self, Event, Filter, ImportStats, Loaded, Page, Request},
-    pgn::{Game, Replay},
+    pgn::{Game, Replay, Token},
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
 use objc2::{AnyThread, rc::Retained};
@@ -149,6 +149,8 @@ pub struct App {
     replay: Option<Replay>,
     current: usize,
     scrolled_node: Option<usize>,
+    /// Branch points of the open game whose side lines are folded in the move list.
+    folded: HashSet<usize>,
     header_icon: egui::TextureHandle,
     piece_art: egui::TextureHandle,
     bookcloth: egui::TextureHandle,
@@ -331,6 +333,7 @@ impl App {
             replay: None,
             current: 0,
             scrolled_node: None,
+            folded: HashSet::new(),
             header_icon,
             piece_art,
             bookcloth,
@@ -690,7 +693,10 @@ impl App {
                     match result {
                         Ok(loaded) => {
                             match loaded.game.replay() {
-                                Ok(replay) => self.replay = Some(replay),
+                                Ok(replay) => {
+                                    self.replay = Some(replay);
+                                    self.folded.clear();
+                                }
                                 Err(e) => {
                                     self.replay = None;
                                     self.error = Some(format!(
@@ -1133,6 +1139,7 @@ impl App {
             game.tags.extend([("SetUp".into(), "1".into()), ("FEN".into(), fen)]);
         }
         self.replay = game.replay().ok();
+        self.folded.clear();
         self.loaded = Some(Loaded { id: -1, game, notes: Default::default(), starred: false });
         self.current = 0;
         // Scratch boards share an id, so replacing one must invalidate its old engine result.
@@ -1162,18 +1169,12 @@ impl App {
                         let (file, rank) = if self.flipped { (7 - col, row) } else { (col, 7 - row) };
                         let square = Square::new((rank * 8 + file) as u32);
                         let rect = egui::Rect::from_min_size(origin + Vec2::new(col as f32 * cell, row as f32 * cell), Vec2::splat(cell));
-                        let tint = if (row + col) % 2 == 0 { Color32::from_rgb(255, 250, 231) } else { Color32::from_rgb(128, 157, 132) };
-                        let uv = egui::Rect::from_min_size(egui::pos2(col as f32 * 0.5, row as f32 * 0.5), Vec2::splat(0.5));
-                        ui.painter().image(self.bookcloth.id(), rect, uv, tint);
                         let piece = editor.setup.board.piece_at(square);
                         let label = piece.map(|p| format!("{square}: {:?} {:?}", p.color, p.role)).unwrap_or_else(|| format!("{square}: empty"));
                         let response = ui.interact(rect, ui.id().with(square), egui::Sense::click());
                         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
                         if response.clicked() { editor.place(square, editor.piece); }
                         if response.secondary_clicked() { editor.place(square, None); }
-                        if let Some(piece) = editor.setup.board.piece_at(square) {
-                            ui.painter().image(self.piece_art.id(), rect, piece_uv(piece), Color32::WHITE);
-                        }
                         if col == 0 {
                             ui.painter().text(egui::pos2(board.left() + 7.0, rect.center().y), egui::Align2::CENTER_CENTER, (rank + 1).to_string(), egui::FontId::proportional(10.0), IVORY);
                         }
@@ -1182,6 +1183,8 @@ impl App {
                         }
                     }
                 }
+                let squares = egui::Rect::from_min_size(origin, Vec2::splat(cell * 8.0));
+                mini_board(ui.painter(), &self.bookcloth, &self.piece_art, squares, &editor.setup.board, self.flipped);
                 ui.vertical(|ui| {
                     ui.set_width(280.0);
                     for color in [Color::White, Color::Black] {
@@ -1806,188 +1809,35 @@ impl App {
                         let editable = self.play.is_none();
                         if let Some(replay) = &self.replay {
                             let mut next = self.current;
-                            let line = replay.line(self.current);
                             egui::ScrollArea::vertical()
                                 .id_salt("moves")
                                 .max_height(self.moves_height)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    let start =
-                                        ui.selectable_label(self.current == 0, "Starting position");
-                                    if start.clicked() {
-                                        next = 0;
-                                    }
-                                    if self.current == 0 && self.scrolled_node != Some(0) {
-                                        start.scroll_to_me(Some(egui::Align::Center));
-                                    }
-                                    // Scoresheet: move number, then White and Black in fixed columns.
-                                    let cell = Vec2::new(((ui.available_width() - 44.0) / 2.0).floor(), 0.0);
-                                    egui::Grid::new("scoresheet")
-                                        .num_columns(3)
-                                        .striped(true)
-                                        .spacing([4.0, 2.0])
-                                        .show(ui, |ui| {
-                                            let mut open = false;
-                                            for &id in line.iter().skip(1) {
-                                                let half = replay.half_move(id);
-                                                if !open {
-                                                    ui.label(RichText::new(format!("{}.", half / 2 + 1)).color(MUTED));
-                                                    if half % 2 == 1 {
-                                                        ui.label("");
-                                                    }
-                                                }
-                                                let alternatives = &replay.nodes[replay.nodes[id].parent.unwrap()].children;
-                                                let noted = self.loaded.as_ref().is_some_and(|l| {
-                                                    l.notes.get(&id).is_some_and(|n| !n.is_empty())
-                                                });
-                                                let tagged = self.loaded.as_ref().and_then(|l| l.game.position_labels.get(&id)?.first().cloned());
-                                                // Your mark, else the PGN's, else the game review's verdict, as on Lichess; a removed mark hides all.
-                                                let glyph = self.loaded.as_ref().and_then(|l| {
-                                                    replay.glyph(&l.game.glyphs, id).or_else(|| {
-                                                        let review = l.game.review.as_ref().filter(|_| !l.game.glyphs.contains_key(&id))?;
-                                                        match review.moves.iter().find(|m| m.node == id)?.quality {
-                                                            engine::Quality::Inaccuracy => Some(6),
-                                                            engine::Quality::Mistake => Some(2),
-                                                            engine::Quality::Blunder => Some(4),
-                                                            _ => None,
-                                                        }
-                                                    })
-                                                }).and_then(glyph_style);
-                                                let response = ui.add(
-                                                    egui::Button::selectable(self.current == id, {
-                                                        // Variations and your own analysis read as asides, not moves from the game.
-                                                        let san = RichText::new(&replay.nodes[id].san);
-                                                        let san = if replay.in_game(id) { san } else { san.italics().color(MUTED) };
-                                                        let mut job = egui::text::LayoutJob::default();
-                                                        san.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                                                        if let Some((symbol, color, _)) = glyph {
-                                                            RichText::new(symbol).strong().color(color).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                                                        }
-                                                        // "+2": this move has two alternatives.
-                                                        if alternatives.len() > 1 {
-                                                            RichText::new(format!(" +{}", alternatives.len() - 1)).small().color(RIBBON).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                                                        }
-                                                        job
-                                                    })
-                                                        .min_size(cell)
-                                                        .right_text({
-                                                            // A diamond in the position's tag colour, then a dot for a note.
-                                                            let mut job = egui::text::LayoutJob::default();
-                                                            if let Some(tag) = &tagged {
-                                                                RichText::new("◆").size(9.0).color(tag_color(tag)).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                                                            }
-                                                            RichText::new(if noted { "•" } else { "" }).color(RIBBON).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
-                                                            job
-                                                        }),
-                                                );
-                                                let response = if alternatives.len() > 1 {
-                                                    let others: Vec<_> = alternatives.iter().filter(|&&a| a != id).map(|&a| replay.nodes[a].san.as_str()).collect();
-                                                    response.on_hover_text(format!("Alternatives: {}", others.join(", ")))
-                                                } else {
-                                                    response
-                                                };
-                                                if self.current == id && self.scrolled_node != Some(id) {
-                                                    response.scroll_to_me(Some(egui::Align::Center));
-                                                }
-                                                if response.clicked() {
-                                                    next = id;
-                                                }
-                                                if let Some(loaded) = &mut self.loaded {
-                                                    // Right-click a move to mark it, as Lichess's ! ? buttons.
-                                                    response.context_menu(|ui| {
-                                                        let mut chosen = None;
-                                                        for nag in [3, 1, 5, 6, 2, 4] {
-                                                            let (symbol, color, name) = glyph_style(nag).unwrap();
-                                                            let text = RichText::new(format!("{symbol}  {name}")).color(color);
-                                                            if ui.add(egui::Button::selectable(glyph.is_some_and(|g| g.0 == symbol), text)).clicked() { chosen = Some(nag); }
-                                                        }
-                                                        if glyph.is_some() && ui.button("Remove mark").clicked() { chosen = Some(0); }
-                                                        if let Some(nag) = chosen {
-                                                            loaded.game.glyphs.insert(id, nag);
-                                                            self.dirty = true;
-                                                            self.edited = Instant::now();
-                                                            ui.close();
-                                                        }
-                                                        if !editable { return; }
-                                                        let parent = replay.nodes[id].parent.unwrap();
-                                                        let first = replay.nodes[parent].children[0];
-                                                        let promotable = first != id && !replay.in_game(first) && replay.nodes[id].position.is_some();
-                                                        let added = id >= loaded.game.first_added(replay);
-                                                        if promotable || added { ui.separator(); }
-                                                        if promotable && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
-                                                            loaded.game.promote(replay, id);
-                                                            rebuild = true;
-                                                        }
-                                                        if added && ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
-                                                            let l = &mut *loaded;
-                                                            l.game.delete_line(replay, &mut l.notes, id);
-                                                            next = parent;
-                                                            rebuild = true;
-                                                        }
-                                                        if rebuild {
-                                                            self.dirty = true;
-                                                            self.edited = Instant::now();
-                                                            ui.close();
-                                                        }
-                                                    });
-                                                    if response.double_clicked() {
-                                                        let marks = &mut loaded.game.bookmarks;
-                                                        if !marks.remove(&id) { marks.insert(id); }
-                                                        self.dirty = true;
-                                                        self.edited = Instant::now();
-                                                    }
-                                                    // A ribbon strip inside the move's left padding marks a bookmark.
-                                                    if loaded.game.bookmarks.contains(&id) {
-                                                        let strip = egui::Rect::from_min_size(response.rect.left_top(), Vec2::new(3.0, response.rect.height()));
-                                                        ui.painter().rect_filled(strip, 1, RIBBON);
-                                                    }
-                                                }
-                                                open = half % 2 == 0;
-                                                if !open {
-                                                    ui.end_row();
-                                                }
-                                            }
-                                            if open {
-                                                ui.end_row();
-                                            }
-                                        });
-                                });
-                            let node = &replay.nodes[self.current];
-                            if let Some(parent) = node.parent
-                                && replay.nodes[parent].children.len() > 1
-                            {
-                                ui.small("Alternatives at this move");
-                                ui.horizontal_wrapped(|ui| {
-                                    for &id in &replay.nodes[parent].children {
-                                        if ui
-                                            .add_enabled(
-                                                replay.nodes[id].position.is_some(),
-                                                egui::Button::new(&replay.nodes[id].san)
-                                                    .selected(id == self.current),
-                                            )
-                                            .clicked()
-                                        {
-                                            next = id;
-                                        }
+                                    let Some(loaded) = &mut self.loaded else { return };
+                                    let mut sheet = Sheet {
+                                        replay,
+                                        cloth: &self.bookcloth,
+                                        art: &self.piece_art,
+                                        flipped: self.flipped,
+                                        first_added: loaded.game.first_added(replay),
+                                        loaded,
+                                        folded: &mut self.folded,
+                                        current: self.current,
+                                        scroll: self.scrolled_node != Some(self.current),
+                                        editable,
+                                        next,
+                                        rebuild: false,
+                                        edited: false,
+                                    };
+                                    sheet.show(ui);
+                                    next = sheet.next;
+                                    rebuild = sheet.rebuild;
+                                    if sheet.edited {
+                                        self.dirty = true;
+                                        self.edited = Instant::now();
                                     }
                                 });
-                            }
-                            if node.children.len() > 1 {
-                                ui.small("Continue with");
-                                ui.horizontal_wrapped(|ui| {
-                                    for &id in &node.children {
-                                        if ui
-                                            .add_enabled(
-                                                replay.nodes[id].position.is_some(),
-                                                egui::Button::new(&replay.nodes[id].san),
-                                            )
-                                            .clicked()
-                                        {
-                                            next = id;
-                                        }
-                                    }
-                                });
-                            }
                             let main = replay.line(0);
                             if !main.contains(&self.current) && ui.button("Return to main line").clicked() {
                                 // Back to the game move the side line branched from.
@@ -2006,6 +1856,7 @@ impl App {
                         if rebuild && let Some(loaded) = &self.loaded {
                             self.replay = loaded.game.replay().ok();
                             self.scrolled_node = None;
+                            self.folded.clear();
                         }
                         if self.play.is_some() {
                             self.play_panel(ui, ctx);
@@ -2063,13 +1914,6 @@ impl App {
                                     if changed {
                                         self.dirty = true;
                                         if self.save() { self.refresh(false); }
-                                    }
-                                }
-                            }
-                            if let Some(replay) = &self.replay {
-                                for annotation in &replay.nodes[self.current].annotations {
-                                    if let crate::pgn::Token::Comment(text) = annotation {
-                                        ui.label(text);
                                     }
                                 }
                             }
@@ -2642,10 +2486,10 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(CLOTH)
-                    .inner_margin(egui::Margin::symmetric(22, 14)),
+                    .inner_margin(egui::Margin::symmetric(22, 7)),
             )
             .show(ctx, |ui| {
-                let rect = ui.max_rect().expand2(Vec2::new(22.0, 14.0));
+                let rect = ui.max_rect().expand2(Vec2::new(22.0, 7.0));
                 material(ui.painter(), &cloth, rect, CLOTH, 150.0);
                 // Rounded spine edge: a lit top thread and a deep shadow along the bottom.
                 ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0_f32, GREEN));
@@ -2656,7 +2500,7 @@ impl eframe::App for App {
                 w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 120, 96));
                 w.noninteractive.fg_stroke.color = Color32::from_rgb(140, 160, 140);
                 ui.horizontal(|ui| {
-                    ui.image((self.header_icon.id(), Vec2::splat(36.0)));
+                    ui.image((self.header_icon.id(), Vec2::splat(30.0)));
                     embossed(ui, "CHESSLIB", 19.0, IVORY);
                     ui.label(
                         RichText::new(" /  A personal chess library")
@@ -2759,6 +2603,8 @@ impl eframe::App for App {
         self.board(ctx);
         self.position_changed();
         self.edit_board(ctx);
+        // Esc cancels the dialogs drawn as windows; egui's modals close on it by themselves.
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if let Some(settings) = &mut self.play_setup {
             let (mut start, mut cancel) = (false, false);
             egui::Window::new("Play vs computer")
@@ -2786,7 +2632,7 @@ impl eframe::App for App {
                 let settings = *settings;
                 self.play_setup = None;
                 self.start_play(settings);
-            } else if cancel {
+            } else if cancel || escape {
                 self.play_setup = None;
             }
         }
@@ -2814,7 +2660,7 @@ impl eframe::App for App {
             if start {
                 self.train_setup = false;
                 self.start_training(None);
-            } else if cancel {
+            } else if cancel || escape {
                 self.train_setup = false;
             }
         }
@@ -3036,7 +2882,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.set_max_width(460.0);
                     ui.label(error);
-                    if ui.button("Dismiss").clicked() {
+                    if ui.button("Dismiss").clicked() || escape {
                         self.error = None;
                     }
                 });
@@ -3180,6 +3026,445 @@ fn quality_style(quality: engine::Quality) -> (Color32, &'static str) {
 }
 
 /// A move mark's symbol, colour and name, for NAGs 1–6; the colours follow `quality_style`.
+/// The move list: the game's moves as a two-column scoresheet, broken wherever side lines or comments branch off.
+/// Side lines follow as indented blocks of clickable moves, nested lines indented again.
+struct Sheet<'a> {
+    replay: &'a Replay,
+    /// For the board preview when hovering a move.
+    cloth: &'a egui::TextureHandle,
+    art: &'a egui::TextureHandle,
+    flipped: bool,
+    loaded: &'a mut Loaded,
+    /// Branch points whose side lines are folded into a one-line summary.
+    folded: &'a mut HashSet<usize>,
+    first_added: usize,
+    current: usize,
+    /// Scroll the current move into view; only once per move, so the list can still be scrolled by hand.
+    scroll: bool,
+    editable: bool,
+    next: usize,
+    rebuild: bool,
+    edited: bool,
+}
+
+/// One piece of the scoresheet, in reading order.
+#[derive(Debug, PartialEq)]
+enum Entry {
+    /// A move number with White's and Black's moves; a missing White move shows "…" after a break.
+    Row(usize, Option<usize>, Option<usize>),
+    Comment(usize),
+    /// Side lines from a node: its children except the game's next move.
+    Branches(usize, Option<usize>),
+}
+
+impl Sheet<'_> {
+    fn show(&mut self, ui: &mut egui::Ui) {
+        let replay = self.replay;
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+        ui.spacing_mut().button_padding = Vec2::new(8.0, 3.0);
+        let main = replay.line(0);
+        let last = *main.last().unwrap();
+        let forks: Vec<usize> = (0..replay.nodes.len())
+            .filter(|&p| replay.nodes[p].children.len() > 1 || (p == last && !replay.nodes[p].children.is_empty()))
+            .collect();
+        ui.horizontal(|ui| {
+            let start = ui.selectable_label(self.current == 0, "Starting position");
+            if start.clicked() {
+                self.next = 0;
+            }
+            if self.current == 0 && self.scroll {
+                start.scroll_to_me(Some(egui::Align::Center));
+            }
+            if !forks.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let fold = self.folded.is_empty();
+                    let label = RichText::new(if fold { "Fold side lines" } else { "Unfold side lines" }).size(12.0).color(MUTED);
+                    if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                        if fold {
+                            self.folded.extend(&forks);
+                        } else {
+                            self.folded.clear();
+                        }
+                    }
+                });
+            }
+        });
+        let entries = scoresheet(replay);
+        let height = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+        let cell = Vec2::new(((ui.available_width() - 36.0) / 2.0).floor(), height);
+        let mut stripe = false;
+        for entry in entries {
+            match entry {
+                Entry::Row(number, white, black) => {
+                    let background = ui.painter().add(egui::Shape::Noop);
+                    let rect = ui
+                        .horizontal(|ui| {
+                            ui.add_sized([24.0, height], egui::Label::new(RichText::new(format!("{number}.")).color(MUTED)));
+                            match white {
+                                Some(id) => {
+                                    self.token(ui, id, false, Some(cell));
+                                }
+                                None => {
+                                    ui.allocate_ui_with_layout(cell, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.set_min_size(cell);
+                                        ui.add_space(ui.spacing().button_padding.x);
+                                        ui.label(RichText::new("…").color(MUTED));
+                                    });
+                                }
+                            }
+                            if let Some(id) = black {
+                                self.token(ui, id, false, Some(cell));
+                            }
+                        })
+                        .response
+                        .rect;
+                    if stripe {
+                        let rect = rect.with_max_x(ui.max_rect().right());
+                        ui.painter().set(background, egui::Shape::rect_filled(rect, 4, ui.visuals().faint_bg_color));
+                    }
+                    stripe = !stripe;
+                }
+                Entry::Comment(id) => {
+                    egui::Frame::new().inner_margin(egui::Margin { left: 30, right: 4, top: 1, bottom: 3 }).show(ui, |ui| {
+                        self.comments(ui, id);
+                    });
+                }
+                Entry::Branches(parent, skip) => self.branches(ui, parent, skip, 1),
+            }
+        }
+    }
+
+    /// The side lines from `parent` as one indented block, or as a one-line summary when folded.
+    fn branches(&mut self, ui: &mut egui::Ui, parent: usize, skip: Option<usize>, depth: usize) {
+        let replay = self.replay;
+        let lines: Vec<usize> = replay.nodes[parent].children.iter().copied().filter(|&c| Some(c) != skip).collect();
+        if lines.is_empty() {
+            return;
+        }
+        let indent = if depth == 1 { 28.0 } else { 0.0 };
+        // A folded block still opens while the current move is inside it.
+        let mut node = self.current;
+        let mut inside = false;
+        while let Some(up) = replay.nodes[node].parent {
+            if up == parent && lines.contains(&node) {
+                inside = true;
+                break;
+            }
+            node = up;
+        }
+        let tint = Color32::from_rgba_unmultiplied(203, 185, 155, 40);
+        let color = if depth == 1 { RIBBON } else { BEVEL };
+        if self.folded.contains(&parent) && !inside {
+            let mut summary: Vec<String> = lines.iter().take(3).map(|&c| replay.label(c)).collect();
+            if lines.len() > 3 {
+                summary.push(format!("+{} more", lines.len() - 3));
+            }
+            let pill = egui::Frame::new()
+                .fill(tint)
+                .corner_radius(4)
+                .inner_margin(egui::Margin { left: 18, right: 8, top: 1, bottom: 1 })
+                .outer_margin(egui::Margin { left: indent as i8, ..Default::default() })
+                .show(ui, |ui| ui.label(RichText::new(summary.join("  ·  ")).size(12.0).italics().color(MUTED)))
+                .response
+                .rect;
+            let pill = pill.with_min_x(pill.min.x + indent);
+            let open = ui.interact(pill, ui.id().with(("unfold", parent)), egui::Sense::click()).on_hover_text("Show these side lines");
+            triangle(ui.painter(), egui::pos2(pill.min.x + 9.0, pill.center().y), false, if open.hovered() { INK } else { color });
+            if open.clicked() {
+                self.folded.remove(&parent);
+            }
+            return;
+        }
+        let mut ticks = Vec::new();
+        let block = egui::Frame::new()
+            // Low alpha, so each nested block reads a shade darker than the one around it.
+            .fill(tint)
+            .corner_radius(4)
+            .inner_margin(egui::Margin { left: 18, right: 4, top: 3, bottom: 3 })
+            .outer_margin(egui::Margin { left: indent as i8, ..Default::default() })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for &start in &lines {
+                    ticks.push(self.line(ui, start, depth));
+                }
+            })
+            .response
+            .rect;
+        let block = block.with_min_x(block.min.x + indent);
+        // The guide strip on the left is a tree of the lines, and folds them when clicked.
+        let gutter = ui
+            .interact(egui::Rect::from_min_size(block.min, Vec2::new(16.0, block.height())), ui.id().with(("fold", parent)), egui::Sense::click())
+            .on_hover_text("Fold these side lines");
+        let stroke = egui::Stroke::new(1.5_f32, if gutter.hovered() { INK } else { color.gamma_multiply(0.55) });
+        let x = block.min.x + 8.5;
+        let last = ticks.last().copied().unwrap_or(block.top());
+        ui.painter().vline(x, (block.top() + 4.0)..=last, stroke);
+        for y in ticks {
+            ui.painter().hline(x..=x + 6.0, y, stroke);
+        }
+        if gutter.hovered() {
+            triangle(ui.painter(), egui::pos2(x, block.top() + 6.0), true, INK);
+        }
+        if gutter.clicked() {
+            self.folded.insert(parent);
+        }
+    }
+
+    /// One side line from `start` along its first moves; its own side lines break it into nested blocks.
+    fn line(&mut self, ui: &mut egui::Ui, start: usize, depth: usize) -> f32 {
+        let replay = self.replay;
+        let mut tick = None;
+        let mut from = Some(start);
+        while let Some(first) = from {
+            let fork = ui
+                .horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(1.0, 2.0);
+                    ui.spacing_mut().button_padding = Vec2::new(3.0, 2.0);
+                    let (mut id, mut numbered) = (first, true);
+                    loop {
+                        let rect = self.token(ui, id, numbered, None);
+                        tick.get_or_insert(rect.center().y);
+                        numbered = self.comments(ui, id);
+                        // Moves branching off here are shown right after this one, before the line goes on.
+                        if id != start && replay.nodes[replay.nodes[id].parent.unwrap()].children.len() > 1 {
+                            return Some(id);
+                        }
+                        match replay.nodes[id].children.first() {
+                            Some(&child) => id = child,
+                            None => return None,
+                        }
+                    }
+                })
+                .inner;
+            from = fork.and_then(|id| {
+                self.branches(ui, replay.nodes[id].parent.unwrap(), Some(id), depth + 1);
+                replay.nodes[id].children.first().copied()
+            });
+        }
+        tick.unwrap_or_default()
+    }
+
+    /// The PGN's comments after a move, in the reader's grey; returns whether there were any.
+    fn comments(&self, ui: &mut egui::Ui, id: usize) -> bool {
+        let mut any = false;
+        for annotation in &self.replay.nodes[id].annotations {
+            if let Token::Comment(text) = annotation {
+                ui.label(RichText::new(text.trim()).size(12.5).italics().color(MUTED));
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// A clickable move with its mark, tag and note signs: in a scoresheet `cell`, or inline in a side line with its
+    /// number (`numbered` also numbers a Black move). Right-click marks it, double-click bookmarks it.
+    fn token(&mut self, ui: &mut egui::Ui, id: usize, numbered: bool, cell: Option<Vec2>) -> egui::Rect {
+        let replay = self.replay;
+        let node = &replay.nodes[id];
+        let note = self.loaded.notes.get(&id).map(|n| n.trim()).filter(|n| !n.is_empty()).map(str::to_owned);
+        let tag = self.loaded.game.position_labels.get(&id).and_then(|t| t.first()).cloned();
+        // Your mark, else the PGN's, else the game review's verdict, as on Lichess; a removed mark hides all.
+        let game = &self.loaded.game;
+        let glyph = replay
+            .glyph(&game.glyphs, id)
+            .or_else(|| {
+                let review = game.review.as_ref().filter(|_| !game.glyphs.contains_key(&id))?;
+                match review.moves.iter().find(|m| m.node == id)?.quality {
+                    engine::Quality::Inaccuracy => Some(6),
+                    engine::Quality::Mistake => Some(2),
+                    engine::Quality::Blunder => Some(4),
+                    _ => None,
+                }
+            })
+            .and_then(glyph_style);
+        let side = cell.is_none();
+        let size = if side { 13.0 } else { 14.0 };
+        // Game moves in ink, the PGN's side lines a shade lighter, your own analysis in green.
+        let ink = if replay.in_game(id) {
+            INK
+        } else if id >= self.first_added {
+            GREEN
+        } else {
+            Color32::from_rgb(84, 78, 62)
+        };
+        let mut job = egui::text::LayoutJob::default();
+        let add = |job: &mut egui::text::LayoutJob, text: RichText| {
+            text.append_to(job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+        };
+        let half = replay.half_move(id);
+        if side && (half.is_multiple_of(2) || numbered) {
+            let dots = if half.is_multiple_of(2) { "." } else { "..." };
+            add(&mut job, RichText::new(format!("{}{dots} ", half / 2 + 1)).size(size).color(MUTED));
+        }
+        add(&mut job, RichText::new(&node.san).size(size).color(ink));
+        if let Some((symbol, color, _)) = glyph {
+            add(&mut job, RichText::new(symbol).size(size).strong().color(color));
+        }
+        // A diamond in the position's tag colour, then a dot for a note.
+        let mut signs = egui::text::LayoutJob::default();
+        let target = if side { &mut job } else { &mut signs };
+        if let Some(tag) = &tag {
+            add(target, RichText::new(" ◆").size(9.0).color(tag_color(tag)));
+        }
+        if note.is_some() {
+            add(target, RichText::new(" •").color(RIBBON));
+        }
+        let mut button = egui::Button::selectable(self.current == id, job);
+        if let Some(cell) = cell {
+            button = button.min_size(cell).right_text(signs);
+        }
+        // Hovering shows the position after the move, and its note, without leaving the current move.
+        let response = ui.add_enabled(node.position.is_some(), button).on_disabled_hover_text("This move from the PGN is illegal here");
+        let response = match &node.position {
+            Some(position) => response.on_hover_ui(|ui| {
+                ui.set_max_width(184.0);
+                ui.label(RichText::new(replay.label(id)).strong());
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(184.0), egui::Sense::hover());
+                mini_board(ui.painter(), self.cloth, self.art, rect, position.board(), self.flipped);
+                if let Some(note) = &note {
+                    let preview: String = note.chars().take(280).collect();
+                    ui.label(if preview.len() < note.len() { format!("{preview}…") } else { preview });
+                }
+            }),
+            None => response,
+        };
+        if self.current == id && self.scroll {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+        if response.clicked() {
+            self.next = id;
+        }
+        let loaded = &mut *self.loaded;
+        // Right-click a move to mark it, as Lichess's ! ? buttons.
+        response.context_menu(|ui| {
+            let mut chosen = None;
+            for nag in [3, 1, 5, 6, 2, 4] {
+                let (symbol, color, name) = glyph_style(nag).unwrap();
+                let text = RichText::new(format!("{symbol}  {name}")).color(color);
+                if ui.add(egui::Button::selectable(glyph.is_some_and(|g| g.0 == symbol), text)).clicked() {
+                    chosen = Some(nag);
+                }
+            }
+            if glyph.is_some() && ui.button("Remove mark").clicked() {
+                chosen = Some(0);
+            }
+            if let Some(nag) = chosen {
+                loaded.game.glyphs.insert(id, nag);
+                self.edited = true;
+                ui.close();
+            }
+            if !self.editable {
+                return;
+            }
+            let parent = node.parent.unwrap();
+            let first = replay.nodes[parent].children[0];
+            let promotable = first != id && !replay.in_game(first) && node.position.is_some();
+            let added = id >= self.first_added;
+            if promotable || added {
+                ui.separator();
+            }
+            if promotable && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
+                loaded.game.promote(replay, id);
+                self.rebuild = true;
+            }
+            if added && ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
+                loaded.game.delete_line(replay, &mut loaded.notes, id);
+                self.next = parent;
+                self.rebuild = true;
+            }
+            if self.rebuild {
+                self.edited = true;
+                ui.close();
+            }
+        });
+        if response.double_clicked() {
+            let marks = &mut loaded.game.bookmarks;
+            if !marks.remove(&id) {
+                marks.insert(id);
+            }
+            self.edited = true;
+        }
+        // A ribbon strip inside the move's left padding marks a bookmark.
+        if loaded.game.bookmarks.contains(&id) {
+            let strip = egui::Rect::from_min_size(response.rect.left_top(), Vec2::new(if side { 2.0 } else { 3.0 }, response.rect.height()));
+            ui.painter().rect_filled(strip, 1, RIBBON);
+        }
+        response.rect
+    }
+}
+
+/// The scoresheet's rows, with the comments and side lines that break them, for the game's main line.
+fn scoresheet(replay: &Replay) -> Vec<Entry> {
+    let main = replay.line(0);
+    let last = *main.last().unwrap();
+    let commented = |id: usize| replay.nodes[id].annotations.iter().any(|t| matches!(t, Token::Comment(_)));
+    let mut entries = Vec::new();
+    if commented(0) {
+        entries.push(Entry::Comment(0));
+    }
+    let mut row: Option<(usize, Option<usize>, Option<usize>)> = None;
+    for &id in &main[1..] {
+        let half = replay.half_move(id);
+        let number = half / 2 + 1;
+        if half.is_multiple_of(2) {
+            entries.extend(row.take().map(|(n, w, b)| Entry::Row(n, w, b)));
+            row = Some((number, Some(id), None));
+        } else if let Some((n, _, black)) = &mut row
+            && *n == number
+        {
+            *black = Some(id);
+        } else {
+            entries.extend(row.take().map(|(n, w, b)| Entry::Row(n, w, b)));
+            row = Some((number, None, Some(id)));
+        }
+        let parent = replay.nodes[id].parent.unwrap();
+        let forks = replay.nodes[parent].children.len() > 1;
+        if half % 2 == 1 || forks || commented(id) {
+            entries.extend(row.take().map(|(n, w, b)| Entry::Row(n, w, b)));
+        }
+        if commented(id) {
+            entries.push(Entry::Comment(id));
+        }
+        if forks {
+            entries.push(Entry::Branches(parent, Some(id)));
+        }
+    }
+    entries.extend(row.take().map(|(n, w, b)| Entry::Row(n, w, b)));
+    // Analysis that continues past the game's last move.
+    if !replay.nodes[last].children.is_empty() {
+        entries.push(Entry::Branches(last, None));
+    }
+    entries
+}
+
+/// The cloth squares and piece art of `board` in `rect`, as the board editor and move previews draw it.
+fn mini_board(painter: &egui::Painter, cloth: &egui::TextureHandle, art: &egui::TextureHandle, rect: egui::Rect, board: &shakmaty::Board, flipped: bool) {
+    let cell = rect.width() / 8.0;
+    for row in 0..8 {
+        for col in 0..8 {
+            let (file, rank) = if flipped { (7 - col, row) } else { (col, 7 - row) };
+            let square = egui::Rect::from_min_size(rect.min + Vec2::new(col as f32 * cell, row as f32 * cell), Vec2::splat(cell));
+            let tint = if (row + col) % 2 == 0 { Color32::from_rgb(255, 250, 231) } else { Color32::from_rgb(128, 157, 132) };
+            let uv = egui::Rect::from_min_size(egui::pos2(col as f32 * 0.5, row as f32 * 0.5), Vec2::splat(0.5));
+            painter.image(cloth.id(), square, uv, tint);
+            if let Some(piece) = board.piece_at(Square::new((rank * 8 + file) as u32)) {
+                painter.image(art.id(), square, piece_uv(piece), Color32::WHITE);
+            }
+        }
+    }
+}
+
+/// A small filled triangle pointing down (open) or right (folded); the fonts lack ▾ and ▸.
+fn triangle(painter: &egui::Painter, center: egui::Pos2, down: bool, color: Color32) {
+    let (a, b) = (3.5, 2.2);
+    let points = if down {
+        vec![center + Vec2::new(-a, -b), center + Vec2::new(a, -b), center + Vec2::new(0.0, b + 1.0)]
+    } else {
+        vec![center + Vec2::new(-b, -a), center + Vec2::new(b + 1.0, 0.0), center + Vec2::new(-b, a)]
+    };
+    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+}
+
 fn glyph_style(nag: u8) -> Option<(&'static str, Color32, &'static str)> {
     Some(match nag {
         1 => ("!", Color32::from_rgb(110, 122, 92), "Good move"),
@@ -3222,6 +3507,29 @@ fn move_destination(movement: Move) -> Square {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoresheet_breaks_rows_for_side_lines_comments_and_later_analysis() {
+        // 1. e4 (1. d4) e5 (1... c5 2. Nf3) 2. Nf3 {Develops.} Nc6, then the reader's 3. Bb5.
+        let m = |san: &str| Token::Move(san.into());
+        let mut game = Game::default();
+        game.tokens = vec![m("e4"), Token::Open, m("d4"), Token::Close, m("e5"), Token::Open, m("c5"), m("Nf3"), Token::Close, m("Nf3"), Token::Comment("Develops.".into()), m("Nc6")];
+        game.study.push(crate::pgn::StudyMove { parent: 4, san: "Bb5".into() });
+        let replay = game.replay().unwrap();
+        assert_eq!(
+            scoresheet(&replay),
+            [
+                Entry::Row(1, Some(1), None),
+                Entry::Branches(0, Some(1)),
+                Entry::Row(1, None, Some(2)),
+                Entry::Branches(1, Some(2)),
+                Entry::Row(2, Some(3), None),
+                Entry::Comment(3),
+                Entry::Row(2, None, Some(4)),
+                Entry::Branches(4, None),
+            ]
+        );
+    }
 
     #[test]
     fn board_editor_placement_clears_stale_rights() {
