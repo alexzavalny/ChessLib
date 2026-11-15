@@ -103,6 +103,8 @@ pub struct Row {
     pub starred: bool,
     /// Every tag on the game and its positions, sorted; filled by search() only.
     pub labels: Vec<String>,
+    /// The breadcrumb for a jump result, if the game is in a folder.
+    pub folder_path: Option<String>,
 }
 pub struct Page {
     pub rows: Vec<Row>,
@@ -186,6 +188,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         starred: r.get(7)?,
         title: r.get(8)?,
         labels: Vec::new(),
+        folder_path: None,
     })
 }
 
@@ -198,12 +201,27 @@ pub fn jump(db: &Connection, query: &str) -> Result<Vec<Row>> {
         .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
         .collect();
     let sql = format!(
-        "SELECT id, white, black, event, date, result, eco, starred, title FROM games WHERE 1 {} ORDER BY id DESC LIMIT 10",
+        "WITH RECURSIVE matches AS MATERIALIZED (
+            SELECT id, white, black, event, date, result, eco, starred, title, folder
+            FROM games WHERE 1 {} ORDER BY id DESC LIMIT 10
+        ), breadcrumbs(game, parent, path) AS (
+            SELECT m.id, f.parent, f.name FROM matches m JOIN folders f ON f.id = m.folder
+            UNION ALL
+            SELECT b.game, f.parent, f.name || ' › ' || b.path
+            FROM breadcrumbs b JOIN folders f ON f.id = b.parent
+        )
+        SELECT m.id, m.white, m.black, m.event, m.date, m.result, m.eco, m.starred, m.title, b.path
+        FROM matches m LEFT JOIN breadcrumbs b ON b.game = m.id AND b.parent IS NULL
+        ORDER BY m.id DESC",
         " AND (title || ' ' || white || ' ' || black) LIKE ? ESCAPE '\\'".repeat(words.len())
     );
     Ok(db
         .prepare(&sql)?
-        .query_map(rusqlite::params_from_iter(words), row)?
+        .query_map(rusqlite::params_from_iter(words), |r| {
+            let mut game = row(r)?;
+            game.folder_path = r.get(9)?;
+            Ok(game)
+        })?
         .collect::<rusqlite::Result<_>>()?)
 }
 
@@ -597,9 +615,14 @@ mod tests {
         let page = search(&db, &Filter::default(), i64::MAX).unwrap();
         let games = |id| page.folders.iter().find(|f| f.id == id).unwrap().games;
         assert_eq!((games(openings), games(sicilian)), (2, 1));
+        let recent = jump(&db, "").unwrap();
+        let paths: Vec<_> = recent.iter().map(|r| r.folder_path.as_deref()).collect();
+        assert_eq!(paths, [None, Some("Openings"), Some("Openings › Sicilian")]);
         rename_folder(&db, sicilian, "Najdorf").unwrap();
+        assert_eq!(jump(&db, "Tal").unwrap()[0].folder_path.as_deref(), Some("Openings › Najdorf"));
         let inner = create_folder(&db, Some(sicilian), "6.Bg5").unwrap();
         delete_folder(&db, sicilian).unwrap();
+        assert_eq!(jump(&db, "Tal").unwrap()[0].folder_path.as_deref(), Some("Openings"));
         assert_eq!(count(openings), 2, "deleting a folder keeps its games");
         assert_eq!(folders(&db).unwrap().iter().find(|f| f.id == inner).unwrap().parent, Some(openings));
         assert_eq!(search(&db, &Filter::default(), i64::MAX).unwrap().all, 3);

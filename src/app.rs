@@ -2387,7 +2387,8 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
-        if self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+        let jump_opened = self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+        if jump_opened {
             self.jump = Some((String::new(), library::jump(&self.db, "").unwrap_or_default(), 0));
         }
         let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
@@ -2705,7 +2706,7 @@ impl eframe::App for App {
         if let Some((query, rows, highlight)) = &mut self.jump {
             let (mut open, mut close) = (None, false);
             let modal = egui::Modal::new(egui::Id::new("jump")).show(ctx, |ui| {
-                ui.set_width(460.0);
+                ui.set_width(460.0_f32.min(ctx.content_rect().width() - 32.0));
                 ui.heading("Jump to game");
                 // Take the arrows and Return before the text field moves its cursor on them.
                 let (up, down, enter) = ui.input_mut(|i| {
@@ -2721,7 +2722,8 @@ impl eframe::App for App {
                         .desired_width(f32::INFINITY),
                 );
                 field.request_focus();
-                if field.changed() {
+                let query_changed = field.changed();
+                if query_changed {
                     // shortcut: queries on the UI thread (~40 ms worst case at 100k games); move to the worker if libraries grow far past that.
                     match library::jump(&self.db, query) {
                         Ok(found) => *rows = found,
@@ -2742,25 +2744,28 @@ impl eframe::App for App {
                 if rows.is_empty() {
                     ui.label("No matching games.");
                 }
-                for (i, row) in rows.iter().enumerate() {
-                    let name = if row.title.is_empty() { format!("{}  —  {}", row.white, row.black) } else { row.title.clone() };
-                    let label = match pretty_date(&row.date) {
-                        Some(date) => format!("{name}   · {date}"),
-                        None => name,
-                    };
-                    let response = ui
-                        .add_sized(
-                            [ui.available_width(), 30.0],
-                            egui::Button::new(label)
-                                .truncate()
-                                .selected(i == *highlight)
-                                .frame(i == *highlight),
-                        )
-                        .on_hover_text(&row.event);
-                    if response.clicked() {
-                        open = Some(row.id);
+                // The modal's layout starts at its previous height, which may fit only one result.
+                let mut results_rect = ui.available_rect_before_wrap();
+                results_rect.max.y = results_rect.min.y + (ctx.content_rect().height() - 120.0).clamp(80.0, 500.0);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(results_rect), |ui| {
+                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, true]);
+                    if jump_opened || query_changed {
+                        scroll = scroll.vertical_scroll_offset(0.0);
                     }
-                }
+                    scroll.show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for (i, row) in rows.iter().enumerate() {
+                            let selected = i == *highlight;
+                            let response = jump_card(ui, row, selected);
+                            if selected && (up || down) {
+                                response.scroll_to_me(None);
+                            }
+                            if response.clicked() {
+                                open = Some(row.id);
+                            }
+                        }
+                    });
+                });
                 close = ui.input(|i| i.key_pressed(egui::Key::Escape));
             });
             if let Some(id) = open {
@@ -3259,6 +3264,49 @@ fn paint_card_badge(
     painter.rect_filled(badge, 5, fill);
     painter.galley(badge.center() - text.size() / 2.0, text, GREEN);
     badge
+}
+
+fn jump_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Response {
+    let name = if row.title.is_empty() {
+        format!("{}  —  {}", row.white, row.black)
+    } else {
+        row.title.clone()
+    };
+    let date = pretty_date(&row.date);
+    let path = row.folder_path.as_deref();
+    let details = || {
+        [Some(name.as_str()), date.as_deref(), path, Some(row.event.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let width = ui.available_width();
+    let (_, rect) = ui.allocate_space(Vec2::new(width, if path.is_some() { 46.0 } else { 32.0 }));
+    let response = ui.interact(rect, ui.make_persistent_id(("jump", row.id)), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, details())
+    });
+    let painter = ui.painter();
+    paint_list_card(painter, &response, selected);
+    let left = rect.left() + 12.0;
+    let right = rect.right() - 12.0;
+    let title_y = rect.top() + if path.is_some() { 15.0 } else { rect.height() / 2.0 };
+    let mut title_right = right;
+    if let Some(date) = date.as_deref() {
+        let date = card_text(painter, date, 11.0, MUTED, (width * 0.3).min(100.0), 1);
+        let size = date.size();
+        title_right -= size.x + 12.0;
+        painter.galley(egui::pos2(right - size.x, title_y - size.y / 2.0), date, MUTED);
+    }
+    let title = card_text(painter, &name, 14.0, INK, title_right - left, 1);
+    painter.galley(egui::pos2(left, title_y - title.size().y / 2.0), title, INK);
+    if let Some(path) = path {
+        let breadcrumb = card_text(painter, path, 11.5, GREEN, right - left, 1);
+        painter.galley(egui::pos2(left, rect.top() + 25.0), breadcrumb, GREEN);
+    }
+    response.on_hover_text(details())
 }
 
 fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Response {
