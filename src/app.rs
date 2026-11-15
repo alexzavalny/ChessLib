@@ -37,6 +37,8 @@ struct PlaySettings {
     level: u8,
     show_evaluation: bool,
 }
+/// What the "Play vs computer" dialog starts with, from its button or P.
+const NEW_PLAY: PlaySettings = PlaySettings { human: Color::White, level: 5, show_evaluation: true };
 
 /// A game against Stockfish, kept in memory and never saved to the library.
 struct Play {
@@ -2564,6 +2566,9 @@ impl eframe::App for App {
             if plain(egui::Key::F) {
                 self.flip();
             }
+            if plain(egui::Key::P) && self.play.is_none() && self.play_setup.is_none() && self.engine_path.is_some() {
+                self.play_setup = Some(NEW_PLAY);
+            }
             if plain(egui::Key::L) && self.engine_path.is_some() {
                 self.continuous = !self.continuous;
                 self.analysis = None;
@@ -2699,7 +2704,7 @@ impl eframe::App for App {
                                 .on_disabled_hover_text("Choose a Stockfish executable to play")
                                 .clicked()
                             {
-                                self.play_setup = Some(PlaySettings { human: Color::White, level: 5, show_evaluation: true });
+                                self.play_setup = Some(NEW_PLAY);
                             }
                             if ui
                                 .add(egui::Button::new("Train on mistakes").fill(GREEN))
