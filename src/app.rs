@@ -7,7 +7,7 @@ use eframe::egui::{self, Color32, RichText, Vec2};
 use objc2::{AnyThread, rc::Retained};
 use objc2_app_kit::NSSound;
 use objc2_foundation::{NSData, NSString, NSUserDefaults, ns_string};
-use shakmaty::{Color, EnPassantMode, Move, Position, Role, Square, fen::Fen};
+use shakmaty::{Color, EnPassantMode, Move, Piece, Position, Role, Setup, Square, fen::Fen};
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -72,7 +72,38 @@ enum FolderEdit {
     Rename(i64),
 }
 
+struct BoardEditor {
+    setup: Setup,
+    piece: Option<Piece>,
+}
+
+impl BoardEditor {
+    fn place(&mut self, square: Square, piece: Option<Piece>) {
+        if let Some(piece) = piece {
+            self.setup.board.set_piece_at(square, piece);
+        } else {
+            self.setup.board.discard_piece_at(square);
+        }
+        // A manually changed board no longer has a known last pawn move.
+        self.setup.ep_square = None;
+        self.setup.halfmoves = 0;
+        for (king, rooks, color) in [
+            (Square::E1, [Square::A1, Square::H1], Color::White),
+            (Square::E8, [Square::A8, Square::H8], Color::Black),
+        ] {
+            for rook in rooks {
+                if self.setup.board.piece_at(king) != Some(color.king())
+                    || self.setup.board.piece_at(rook) != Some(color.rook())
+                {
+                    self.setup.castling_rights.discard(rook);
+                }
+            }
+        }
+    }
+}
+
 pub struct App {
+    board_editor: Option<BoardEditor>,
     play: Option<Play>,
     play_setup: Option<PlaySettings>,
     /// The "Train on mistakes" player field while its dialog is open; the name is kept for next time.
@@ -265,6 +296,7 @@ impl App {
         );
         let (requests, events, receive) = library::worker(path.clone(), ctx.clone());
         let mut app = Self {
+            board_editor: None,
             play: None,
             play_setup: None,
             train_setup: false,
@@ -1101,6 +1133,146 @@ impl App {
         self.replay = game.replay().ok();
         self.loaded = Some(Loaded { id: -1, game, notes: Default::default(), starred: false });
         self.current = 0;
+        // Scratch boards share an id, so replacing one must invalidate its old engine result.
+        self.board_position = None;
+        self.analysis_position = None;
+        self.analysis = None;
+        self.lines.clear();
+        self.review_job = None;
+        self.review_error = None;
+        self.review_progress = (0, 0);
+        self.slide = None;
+    }
+
+    fn edit_board(&mut self, ctx: &egui::Context) {
+        let Some(editor) = &mut self.board_editor else { return };
+        let (mut apply, mut cancel) = (None, false);
+        let modal = egui::Modal::new(egui::Id::new("board-editor")).show(ctx, |ui| {
+            ui.heading("Board editor");
+            ui.label("Choose a piece, then click squares to place it. Right-click to remove.");
+            ui.horizontal_top(|ui| {
+                let cell = 46.0;
+                let (board, _) = ui.allocate_exact_size(Vec2::splat(cell * 8.0 + 28.0), egui::Sense::hover());
+                material(ui.painter(), &self.bookcloth, board, CLOTH, 150.0);
+                let origin = board.min + Vec2::splat(14.0);
+                for row in 0..8 {
+                    for col in 0..8 {
+                        let (file, rank) = if self.flipped { (7 - col, row) } else { (col, 7 - row) };
+                        let square = Square::new((rank * 8 + file) as u32);
+                        let rect = egui::Rect::from_min_size(origin + Vec2::new(col as f32 * cell, row as f32 * cell), Vec2::splat(cell));
+                        let tint = if (row + col) % 2 == 0 { Color32::from_rgb(255, 250, 231) } else { Color32::from_rgb(128, 157, 132) };
+                        let uv = egui::Rect::from_min_size(egui::pos2(col as f32 * 0.5, row as f32 * 0.5), Vec2::splat(0.5));
+                        ui.painter().image(self.bookcloth.id(), rect, uv, tint);
+                        let piece = editor.setup.board.piece_at(square);
+                        let label = piece.map(|p| format!("{square}: {:?} {:?}", p.color, p.role)).unwrap_or_else(|| format!("{square}: empty"));
+                        let response = ui.interact(rect, ui.id().with(square), egui::Sense::click());
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                        if response.clicked() { editor.place(square, editor.piece); }
+                        if response.secondary_clicked() { editor.place(square, None); }
+                        if let Some(piece) = editor.setup.board.piece_at(square) {
+                            ui.painter().image(self.piece_art.id(), rect, piece_uv(piece), Color32::WHITE);
+                        }
+                        if col == 0 {
+                            ui.painter().text(egui::pos2(board.left() + 7.0, rect.center().y), egui::Align2::CENTER_CENTER, (rank + 1).to_string(), egui::FontId::proportional(10.0), IVORY);
+                        }
+                        if row == 7 {
+                            ui.painter().text(egui::pos2(rect.center().x, board.bottom() - 7.0), egui::Align2::CENTER_CENTER, ((b'a' + file as u8) as char).to_string(), egui::FontId::proportional(10.0), IVORY);
+                        }
+                    }
+                }
+                ui.vertical(|ui| {
+                    ui.set_width(280.0);
+                    for color in [Color::White, Color::Black] {
+                        ui.label(if color == Color::White { "White pieces" } else { "Black pieces" });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            for role in [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn] {
+                                let piece = Piece { color, role };
+                                let label = format!("{color:?} {role:?}");
+                                let image = egui::Image::new((self.piece_art.id(), Vec2::splat(30.0))).uv(piece_uv(piece));
+                                let response = ui.add(egui::Button::image(image).min_size(Vec2::splat(42.0)).selected(editor.piece == Some(piece)));
+                                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                                if response.on_hover_text(label).clicked() { editor.piece = Some(piece); }
+                            }
+                        });
+                    }
+                    ui.selectable_value(&mut editor.piece, None, "Eraser");
+                    ui.horizontal(|ui| {
+                        if ui.button("Clear board").clicked() { editor.setup = Setup::empty(); }
+                        if ui.button("Starting position").clicked() { editor.setup = Setup::initial(); }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("To move");
+                        let before = editor.setup.turn;
+                        ui.selectable_value(&mut editor.setup.turn, Color::White, "White");
+                        ui.selectable_value(&mut editor.setup.turn, Color::Black, "Black");
+                        if editor.setup.turn != before { editor.setup.ep_square = None; }
+                    });
+                    ui.label("Castling rights");
+                    for (color, king, rooks) in [
+                        (Color::White, Square::E1, [Square::H1, Square::A1]),
+                        (Color::Black, Square::E8, [Square::H8, Square::A8]),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{color:?}"));
+                            for (rook, label) in rooks.into_iter().zip(["O-O", "O-O-O"]) {
+                                let available = editor.setup.board.piece_at(king) == Some(color.king()) && editor.setup.board.piece_at(rook) == Some(color.rook());
+                                let mut enabled = editor.setup.castling_rights.contains(rook);
+                                if ui.add_enabled(available, egui::Checkbox::new(&mut enabled, label)).changed() {
+                                    editor.setup.castling_rights.set(rook, enabled);
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("En passant");
+                        egui::ComboBox::from_id_salt("editor-ep")
+                            .selected_text(editor.setup.ep_square.map(|s| s.to_string()).unwrap_or_else(|| "None".into()))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut editor.setup.ep_square, None, "None");
+                                let rank = if editor.setup.turn == Color::White { 5 } else { 2 };
+                                for file in 0..8 {
+                                    let square = Square::new(rank * 8 + file);
+                                    ui.selectable_value(&mut editor.setup.ep_square, Some(square), square.to_string());
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Move number");
+                        let mut number = editor.setup.fullmoves.get();
+                        if ui.add(egui::DragValue::new(&mut number).range(1..=u32::MAX)).changed() {
+                            editor.setup.fullmoves = std::num::NonZeroU32::new(number).unwrap();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Halfmove clock");
+                        ui.add(egui::DragValue::new(&mut editor.setup.halfmoves).range(0..=u32::MAX));
+                    });
+                });
+            });
+            ui.set_width(690.0);
+            let position = editor.setup.clone().position::<shakmaty::Chess>(shakmaty::CastlingMode::Standard);
+            if let Err(error) = &position {
+                ui.colored_label(RIBBON, format!("Invalid position: {error}."));
+            } else {
+                ui.label("Position is valid.");
+            }
+            ui.small("Apply starts a new line from this position, replacing this unsaved board's moves and notes.");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(position.is_ok(), egui::Button::new("Apply position")).clicked() { apply = position.ok(); }
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if let Some(position) = apply {
+            let flipped = self.flipped;
+            self.show_analysis_board(Some(&position));
+            self.flipped = flipped;
+            self.dirty = false;
+            self.board_editor = None;
+            self.position_changed();
+        } else if cancel || modal.should_close() {
+            self.board_editor = None;
+        }
     }
 
     /// Puzzles from one game (both sides), or from every reviewed game for the remembered player.
@@ -1943,9 +2115,14 @@ impl App {
             };
             ui.label(RichText::new("GAME WORKSPACE").size(11.0).strong().color(GREEN));
             let saved = loaded.id >= 0;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(title);
                 let starred = self.loaded.as_ref().unwrap().starred;
+                if self.play.is_none() && !saved && !self.loading && ui.button("Board editor").clicked()
+                    && let Some(position) = self.replay.as_ref().and_then(|r| r.nodes[self.current].position.as_ref())
+                {
+                    self.board_editor = Some(BoardEditor { setup: position.to_setup(EnPassantMode::Always), piece: Some(Color::White.pawn()) });
+                }
                 if self.play.is_none() && !saved && ui.button("Save to library").clicked() {
                     self.save_analysis(ctx);
                 }
@@ -2034,18 +2211,6 @@ impl App {
             let mut clicked = None;
             let mut dragged = None;
             let mut drop = false;
-            let piece_uv = |piece: shakmaty::Piece| {
-                let column = match piece.role {
-                    Role::King => 0,
-                    Role::Queen => 1,
-                    Role::Bishop => 2,
-                    Role::Knight => 3,
-                    Role::Rook => 4,
-                    Role::Pawn => 5,
-                };
-                let top = if piece.color == Color::White { 0.0 } else { 0.5 };
-                egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5))
-            };
             let square_at = |p: egui::Pos2| {
                 let (c, r) = ((((p.x - origin.x) / cell) as usize).min(7), (((p.y - origin.y) / cell) as usize).min(7));
                 let (f, rk) = if self.flipped { (7 - c, r) } else { (c, 7 - r) };
@@ -2378,21 +2543,21 @@ impl eframe::App for App {
                 self.error = Some(format!("The library folder is saved, but ChessLib could not restart: {e}. Quit and open it again."));
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+        let jump_opened = self.board_editor.is_none() && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+        if self.board_editor.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.choose_import(ctx);
         }
-        if self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+        if self.board_editor.is_none() && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
             self.new_board();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+        if self.board_editor.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
-        let jump_opened = self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
         if jump_opened {
             self.jump = Some((String::new(), library::jump(&self.db, "").unwrap_or_default(), 0));
         }
         let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
-        if !ctx.wants_keyboard_input() {
+        if self.board_editor.is_none() && !ctx.wants_keyboard_input() {
             if plain(egui::Key::F) {
                 self.flip();
             }
@@ -2411,7 +2576,7 @@ impl eframe::App for App {
                 self.play(best);
             }
         }
-        if !ctx.wants_keyboard_input()
+        if self.board_editor.is_none() && !ctx.wants_keyboard_input()
             && let Some(replay) = &self.replay
         {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
@@ -2439,11 +2604,11 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        if !drops.is_empty() {
+        if self.board_editor.is_none() && !drops.is_empty() {
             self.import_files(drops, ctx);
         }
         // ⌘V outside a text field imports pasted PGN or FEN (a FEN on the analysis board sets it up instead); the importer reads files, so stage it in one.
-        let pasted = if ctx.wants_keyboard_input() || self.importing { None } else {
+        let pasted = if self.board_editor.is_some() || ctx.wants_keyboard_input() || self.importing { None } else {
             ctx.input(|i| i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) if !text.trim().is_empty() => Some(text.clone()),
                 _ => None,
@@ -2585,6 +2750,7 @@ impl eframe::App for App {
         self.position_changed();
         self.board(ctx);
         self.position_changed();
+        self.edit_board(ctx);
         if let Some(settings) = &mut self.play_setup {
             let (mut start, mut cancel) = (false, false);
             egui::Window::new("Play vs computer")
@@ -3026,6 +3192,19 @@ fn glyph_style(nag: u8) -> Option<(&'static str, Color32, &'static str)> {
     })
 }
 
+fn piece_uv(piece: Piece) -> egui::Rect {
+    let column = match piece.role {
+        Role::King => 0,
+        Role::Queen => 1,
+        Role::Bishop => 2,
+        Role::Knight => 3,
+        Role::Rook => 4,
+        Role::Pawn => 5,
+    };
+    let top = if piece.color == Color::White { 0.0 } else { 0.5 };
+    egui::Rect::from_min_max(egui::pos2(column as f32 / 6.0, top), egui::pos2((column + 1) as f32 / 6.0, top + 0.5))
+}
+
 fn move_destination(movement: Move) -> Square {
     match movement {
         Move::Castle { king, rook } => Square::from_coords(
@@ -3043,6 +3222,58 @@ fn move_destination(movement: Move) -> Square {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_editor_placement_clears_stale_rights() {
+        let mut editor = BoardEditor { setup: Setup::initial(), piece: None };
+        editor.setup.ep_square = Some(Square::E3);
+        editor.setup.halfmoves = 12;
+        editor.place(Square::H1, None);
+        assert_eq!(editor.setup.board.piece_at(Square::H1), None);
+        assert!(!editor.setup.castling_rights.contains(Square::H1));
+        assert!(editor.setup.castling_rights.contains(Square::A1));
+        assert_eq!(editor.setup.ep_square, None);
+        assert_eq!(editor.setup.halfmoves, 0);
+        editor.place(Square::H1, Some(Color::White.rook()));
+        assert!(!editor.setup.castling_rights.contains(Square::H1));
+        editor.place(Square::E1, Some(Color::White.queen()));
+        assert!(!editor.setup.castling_rights.contains(Square::A1));
+        assert!(editor.setup.castling_rights.contains(Square::A8));
+        assert!(editor.setup.castling_rights.contains(Square::H8));
+    }
+
+    #[test]
+    fn board_editor_rejects_invalid_positions_and_exports_a_playable_setup() {
+        let mut editor = BoardEditor { setup: Setup::empty(), piece: None };
+        let validate = |setup: &Setup| setup.clone().position::<shakmaty::Chess>(shakmaty::CastlingMode::Standard).map_err(|e| e.to_string());
+        assert!(validate(&editor.setup).is_err());
+        editor.place(Square::E1, Some(Color::White.king()));
+        editor.place(Square::E8, Some(Color::Black.king()));
+        editor.place(Square::A8, Some(Color::White.pawn()));
+        assert!(validate(&editor.setup).is_err());
+        editor.place(Square::A8, None);
+        editor.place(Square::E2, Some(Color::Black.king()));
+        assert!(validate(&editor.setup).is_err());
+        editor.place(Square::E2, None);
+        editor.place(Square::D4, Some(Color::Black.pawn()));
+        editor.place(Square::E4, Some(Color::White.pawn()));
+        editor.setup.turn = Color::Black;
+        editor.setup.ep_square = Some(Square::E3);
+        editor.setup.fullmoves = std::num::NonZeroU32::new(20).unwrap();
+        let position = validate(&editor.setup).unwrap();
+        let fen = Fen::from_position(&position, EnPassantMode::Legal).to_string();
+        assert_eq!(fen, "4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 20");
+        let mut game = Game::default();
+        game.set_tag("SetUp", "1".into());
+        game.set_tag("FEN", fen.clone());
+        let mut replay = game.replay().unwrap();
+        let movement = "dxe3".parse::<shakmaty::san::San>().unwrap().to_move(&position).unwrap();
+        game.play(&mut replay, 0, movement).unwrap();
+        let exported = game.export_as_game(&Default::default()).unwrap();
+        let imported = pgn_reader::Reader::new(exported.as_bytes()).read_game(&mut crate::pgn::Parser).unwrap().unwrap().unwrap();
+        assert_eq!(imported.tag("FEN"), fen);
+        assert_eq!(imported.mainline_positions().unwrap().len(), 2);
+    }
 
     #[test]
     fn evaluation_bar_handles_unknown_scores_advantages_and_mates() {
