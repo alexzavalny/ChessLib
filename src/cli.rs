@@ -43,6 +43,8 @@ ChessLib command line (run with no arguments for the app). Every command prints 
                                             G, R, B or Y (green by default), as games show lists them
   chesslib games play ID NODE SAN...        add moves after NODE; moves already there are reused
   chesslib games promote ID NODE            make a variation the continuation of its line
+  chesslib games main-line ID NODE          make NODE's line the main line, even over the game's own moves (they
+                                            become a side line and nodes renumber); prints NODE's new number
   chesslib games delete-line ID NODE        remove an added line from NODE on; later added nodes renumber
   chesslib folders list                     game counts include subfolders
   chesslib folders create NAME [--parent FOLDER]
@@ -386,6 +388,15 @@ fn command(db: &mut Connection, path: &Path, args: &mut Args) -> Result<Value> {
             })?;
             json!({"ok": true})
         }
+        ["games", "main-line", g, n] => {
+            let id = game(db, g)?;
+            args.done()?;
+            let moved = edit(db, id, |l| {
+                let (replay, n) = node(&l.game, n)?;
+                l.game.set_main_line(&replay, &mut l.notes, n).with_context(|| format!("Node {n} is already on the main line, or is illegal"))
+            })?;
+            json!({"node": moved})
+        }
         ["games", "delete-line", g, n] => {
             let id = game(db, g)?;
             args.done()?;
@@ -675,9 +686,14 @@ mod tests {
         cli(db, "games undraw 1 4 c7c5 e4").unwrap();
         assert!(cli(db, "games show 1").unwrap()["moves"][4].get("drawings").is_none());
         assert!(cli(db, "games promote 1 4").is_err(), "the game's own 1... e5 stays first");
+        assert!(cli(db, "games main-line 1 2").is_err(), "already the main line");
         assert!(cli(db, "games delete-line 1 2").is_err(), "imported moves stay");
         cli(db, "games delete-line 1 4").unwrap();
         assert_eq!(cli(db, "games show 1").unwrap()["moves"].as_array().unwrap().len(), 4);
+        cli(db, "games play 1 1 c5").unwrap();
+        assert_eq!(cli(db, "games main-line 1 4").unwrap(), json!({"node": 2}), "1... c5 replaces the game's 1... e5");
+        assert_eq!(cli(db, "games show 1").unwrap()["moves"][2]["move"], "1... c5");
+        assert_eq!(cli(db, "games main-line 1 3").unwrap(), json!({"node": 2}), "and back");
 
         cli(db, "games star 1 2").unwrap();
         cli(db, "games unstar 2").unwrap();

@@ -1,7 +1,7 @@
 use crate::{
     engine,
     library::{self, Event, Filter, ImportStats, Loaded, Page, Request},
-    pgn::{Game, Replay, Token},
+    pgn::{Game, Replay},
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
 use objc2::{AnyThread, rc::Retained};
@@ -171,6 +171,7 @@ pub struct App {
     /// Engine lines for the current position, sorted by MultiPV rank.
     lines: Vec<engine::Evaluation>,
     engine_lines: usize,
+    engine_settings_open: bool,
     /// Height of the move list, set by dragging the rule below it.
     moves_height: f32,
     /// Height of the sidebar folder tree, set by dragging the rule below it.
@@ -367,6 +368,7 @@ impl App {
             },
             analysis_error: None,
             continuous: false,
+            engine_settings_open: false,
             review_job: None,
             review_game: None,
             review_progress: (0, 0),
@@ -1422,6 +1424,12 @@ impl App {
             }
         }
         let human = play.settings.human;
+        // Stockfish already answered here (a step forward, or the player repeated a move), so go on to its answer.
+        if replay.nodes[self.current].position.as_ref().is_some_and(|p| p.turn() != human)
+            && let Some(next) = replay.next(self.current)
+        {
+            self.current = next;
+        }
         section(ui, "Play vs Stockfish", &format!("Level {}", play.settings.level));
         let Some(position) = replay.nodes[self.current].position.clone() else { return };
         let over = position.outcome().known();
@@ -1452,7 +1460,7 @@ impl App {
         } else if position.turn() == human {
             ui.label(RichText::new("Your move").strong());
         } else if play.error.is_none() {
-            ui.label("Stockfish to move. Return to the last move to continue.");
+            ui.label("Stockfish to move.");
         }
         if let Some(error) = play.error.clone() {
             ui.colored_label(Color32::DARK_RED, error);
@@ -1559,7 +1567,6 @@ impl App {
                 Err(e) => self.review_error = Some(e.to_string()),
             }
         }
-        section(ui, "Stockfish", &self.lines.first().map(|e| format!("Depth {}", e.depth)).unwrap_or_default());
         let position = self
             .replay
             .as_ref()
@@ -1567,78 +1574,72 @@ impl App {
         let terminal = position.as_ref().is_some_and(|p| p.outcome().is_known());
         let available =
             position.is_some() && !terminal && !self.loading && self.engine_path.is_some();
-        // Row as tall as a button, so the checkbox centres against the dropdown.
-        let row = Vec2::new(ui.available_width(), ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y);
-        ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(
-                    self.engine_path.is_some(),
-                    egui::Checkbox::new(&mut self.continuous, "Continuous"),
-                )
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().button_padding = Vec2::new(6.0, 5.0);
+            ui.label(RichText::new("Stockfish").strong());
+            if ui.add_enabled(self.engine_path.is_some(), |ui: &mut egui::Ui| analysis_toggle(ui, &mut self.continuous))
                 .on_hover_text("Continuous analysis (L)")
                 .changed()
             {
                 self.analysis = None;
+                self.lines.clear();
                 self.analysis_error = None;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let before = self.engine_lines;
-                egui::ComboBox::from_id_salt("engine-lines")
-                    .width(76.0)
-                    .selected_text(format!("{} {}", self.engine_lines, if self.engine_lines == 1 { "line" } else { "lines" }))
-                    .show_ui(ui, |ui| {
-                        for n in 1..=5 {
-                            ui.selectable_value(&mut self.engine_lines, n, n.to_string());
-                        }
-                    })
-                    .response
-                    .on_hover_text("How many candidate moves Stockfish calculates and shows as arrows");
-                if self.engine_lines != before {
-                    NSUserDefaults::standardUserDefaults()
-                        .setInteger_forKey(self.engine_lines as _, ns_string!("EngineLines"));
-                    self.analysis = None;
+                let settings = ui.button("⚙").on_hover_text("Stockfish settings");
+                settings.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Stockfish settings"));
+                if settings.clicked() {
+                    self.engine_settings_open = true;
+                }
+                if ui
+                    .add_enabled(
+                        available && self.review_job.is_none(),
+                        egui::Button::new("Analyze 3 s"),
+                    )
+                    .on_hover_text("Analyze this position once for three seconds")
+                    .clicked()
+                {
+                    self.continuous = false;
+                    drop(self.analysis.take());
                     self.lines.clear();
+                    self.analysis_error = None;
+                    self.analysis = Some(engine::start(
+                        self.engine_path.clone().unwrap(),
+                        position.clone().unwrap(),
+                        false,
+                        self.engine_lines,
+                        ctx.clone(),
+                    ));
                 }
             });
         });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    available && self.review_job.is_none(),
-                    egui::Button::new("Analyze 3 s"),
-                )
-                .on_hover_text("Analyze this position once for three seconds")
-                .clicked()
-            {
-                self.continuous = false;
-                drop(self.analysis.take());
-                self.lines.clear();
-                self.analysis_error = None;
-                self.analysis = Some(engine::start(
-                    self.engine_path.clone().unwrap(),
-                    position.clone().unwrap(),
-                    false,
-                    self.engine_lines,
-                    ctx.clone(),
-                ));
-            }
-            if let Some(best) = self.lines.first().and_then(|e| e.best)
-                && ui
-                    .add_enabled(!self.loading, egui::Button::new("Play best"))
-                    .clicked()
-            {
-                self.play(best);
-            }
-            if self.analysis.is_some() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Stop").clicked() {
-                        self.continuous = false;
-                        self.analysis = None;
-                    }
-                    ui.spinner();
-                });
-            }
-        });
+        if !self.lines.is_empty() || self.analysis.is_some() {
+            ui.horizontal(|ui| {
+                if let Some(line) = self.lines.first() {
+                    ui.small(format!("Depth {}", line.depth));
+                }
+                if let Some(best) = self.lines.first().and_then(|e| e.best)
+                    && ui
+                        .add_enabled(!self.loading, egui::Button::new("Play best"))
+                        .clicked()
+                {
+                    self.play(best);
+                }
+                if self.analysis.is_some() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Stop").clicked() {
+                            self.continuous = false;
+                            self.analysis = None;
+                            self.lines.clear();
+                        }
+                        ui.spinner();
+                    });
+                }
+            });
+        }
         if self.continuous && available && self.analysis.is_none() && self.review_job.is_none() {
             self.analysis = Some(engine::start(
                 self.engine_path.clone().unwrap(),
@@ -1671,7 +1672,34 @@ impl App {
             ui.label("Choose a local Stockfish executable to enable offline analysis.");
             ui.hyperlink_to("Get Stockfish", "https://stockfishchess.org/download/");
         }
-        ui.collapsing("Engine settings", |ui| {
+    }
+
+    fn engine_settings(&mut self, ctx: &egui::Context) {
+        if !self.engine_settings_open { return; }
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("stockfish-settings")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Stockfish settings");
+            ui.horizontal(|ui| {
+                ui.label("Lines");
+                let before = self.engine_lines;
+                egui::ComboBox::from_id_salt("engine-line-count")
+                    .selected_text(self.engine_lines.to_string())
+                    .show_ui(ui, |ui| {
+                        for n in 1..=5 {
+                            ui.selectable_value(&mut self.engine_lines, n, n.to_string());
+                        }
+                    })
+                    .response
+                    .on_hover_text("How many candidate moves Stockfish calculates and shows as arrows");
+                if self.engine_lines != before {
+                    NSUserDefaults::standardUserDefaults()
+                        .setInteger_forKey(self.engine_lines as _, ns_string!("EngineLines"));
+                    self.analysis = None;
+                    self.lines.clear();
+                }
+            });
+            section(ui, "Engine settings", "");
             if let Some(path) = &self.engine_path {
                 ui.small(path.display().to_string());
             }
@@ -1688,7 +1716,14 @@ impl App {
                 self.engine_path = Some(path);
             }
             ui.small("Runs locally on one CPU thread. No game data is uploaded.");
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.button("Done").clicked();
+            });
         });
+        if close || modal.should_close() {
+            self.engine_settings_open = false;
+        }
     }
 
     fn review_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1734,6 +1769,9 @@ impl App {
         if let Some(report) = self.loaded.as_ref().and_then(|g| g.game.review.as_ref()) {
             if self.review_job.is_some() {
                 ui.small("Previous completed report");
+            }
+            if report.milliseconds_per_position == 0 {
+                ui.small("From the evaluations in the PGN. They name no best moves; Analyze whole game for Stockfish's.");
             }
             let right = |ui: &mut egui::Ui, text: RichText| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(text));
@@ -1857,6 +1895,8 @@ impl App {
                             self.replay = loaded.game.replay().ok();
                             self.scrolled_node = None;
                             self.folded.clear();
+                            // Node numbers may have changed, so the board does not glide or click from the old number.
+                            self.board_position = Some((loaded.id, self.current));
                         }
                         if self.play.is_some() {
                             self.play_panel(ui, ctx);
@@ -1948,11 +1988,13 @@ impl App {
             let desk = ui.max_rect().expand(24.0);
             material(ui.painter(), &cloth, desk, PAPER, 300.0);
             top_shadow(ui.painter(), desk, 10);
-            if self.loaded.is_none() {
-                return;
+            let title = self.loaded.as_ref().map(|loaded| if loaded.id < 0 { "Analysis board".into() } else if !loaded.game.tag("Title").is_empty() { loaded.game.tag("Title").to_owned() } else { format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black")) });
+            // The window is named after the open game, as its heading below.
+            let window = title.clone().unwrap_or_else(|| "ChessLib".into());
+            if ctx.input(|i| i.viewport().title.as_deref() != Some(window.as_str())) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(window));
             }
-            let loaded = self.loaded.as_ref().unwrap();
-            let title = if loaded.id < 0 { "Analysis board".into() } else if !loaded.game.tag("Title").is_empty() { loaded.game.tag("Title").to_owned() } else { format!("{} — {}",loaded.game.tag("White"),loaded.game.tag("Black")) };
+            let (Some(loaded), Some(title)) = (self.loaded.as_ref(), title) else { return };
             let subtitle = match &self.play {
                 Some(play) if play.train.is_some() => "Train on mistakes  ·  find the better move".into(),
                 Some(play) => format!("Play vs computer  ·  you play {}", if play.settings.human == Color::White { "White" } else { "Black" }),
@@ -2001,12 +2043,15 @@ impl App {
             // Room below for the controls row, plus the review graph or its hint line when shown.
             let has_review = self.loaded.as_ref().is_some_and(|l| l.game.review.is_some());
             let reserve = if has_review { 125.0 } else if self.play.is_some() { 52.0 } else { 75.0 };
-            let side = (ui.available_width()-64.0-BIND).min(ui.available_height()-reserve-2.0*BIND).max(240.0);
+            // A game with Lichess clocks keeps room right of the board for them.
+            let has_clocks = self.loaded.as_ref().is_some_and(|l| l.game.tokens.iter().any(|t| matches!(t, crate::pgn::Token::Comment(c) if c.contains("[%clk "))));
+            let room = if has_clocks { 80.0 } else { 0.0 };
+            let side = (ui.available_width()-64.0-BIND-room).min(ui.available_height()-reserve-2.0*BIND).max(240.0);
             let cell = side/8.0;
             // Centre the squares in the desk; the evaluation bar hangs to their left, so a narrow window
-            // shifts the board right just enough to keep the bar on screen.
+            // shifts the board right just enough to keep the bar on screen, and left just enough for the clocks.
             let (row,_) = ui.allocate_exact_size(Vec2::new(ui.available_width(),side+2.0*BIND),egui::Sense::hover());
-            let left = (row.center().x - side/2.0 - 64.0).max(row.left());
+            let left = (row.center().x - side/2.0 - 64.0).min(row.right() - side - 64.0 - BIND - room).max(row.left());
             let rect = egui::Rect::from_min_size(egui::pos2(left, row.top()), Vec2::new(side+64.0+BIND,side+2.0*BIND));
             let origin = rect.min+Vec2::new(64.0,BIND);
             let squares = egui::Rect::from_min_size(origin, Vec2::splat(side));
@@ -2020,6 +2065,25 @@ impl App {
             // Squares sit in a shallow recess pressed into the cover.
             painter.rect_stroke(squares, 0, egui::Stroke::new(3.0_f32, CLOTH_SHADOW), egui::StrokeKind::Outside);
             painter.hline(squares.x_range().expand(3.0), squares.bottom() + 3.5, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(30)));
+            if has_clocks {
+                // Each side's clock after its latest move, by its edge of the board as on Lichess; the side to move's in cloth.
+                let mut clocks = [None, None];
+                let mut node = self.current;
+                while let Some(parent) = replay.nodes[node].parent && clocks.iter().any(Option::is_none) {
+                    let clock = &mut clocks[replay.half_move(node) % 2];
+                    if clock.is_none() { *clock = replay.command(node, "clk"); }
+                    node = parent;
+                }
+                for (white, y, align) in [(self.flipped, squares.top(), egui::Align2::LEFT_TOP), (!self.flipped, squares.bottom(), egui::Align2::LEFT_BOTTOM)] {
+                    let Some(clock) = clocks[usize::from(!white)] else { continue };
+                    let running = pos.turn().is_white() == white;
+                    let text = clock.strip_prefix("0:").unwrap_or(clock);
+                    let galley = painter.layout_no_wrap(text.into(), egui::FontId::proportional(16.0), if running { IVORY } else { INK });
+                    let chip = align.anchor_size(egui::pos2(cover.right() + 10.0, y), galley.size() + Vec2::new(16.0, 8.0));
+                    painter.rect(chip, 4, if running { CLOTH } else { PAPER }, egui::Stroke::new(1.0_f32, CLOTH_SHADOW), egui::StrokeKind::Inside);
+                    painter.galley(chip.center() - galley.size() / 2.0, galley, INK);
+                }
+            }
             if self.play.as_ref().is_none_or(|p| p.settings.show_evaluation) {
             let saved_score = self.loaded.as_ref().and_then(|g| g.game.review.as_ref())
                 .and_then(|report| report.moves.iter().find(|m| m.node == self.current)).map(|m| m.score.as_str());
@@ -2287,7 +2351,7 @@ impl App {
             let fen = Fen::from_position(pos,EnPassantMode::Legal).to_string();
             ui.horizontal(|ui| {
                 if ui.add_enabled(self.current>0,egui::Button::new("|←")).on_hover_text("Starting position · Home").clicked() { self.current=0; }
-                if ui.add_enabled(parent.is_some(),egui::Button::new("←")).on_hover_text("Previous move · Left arrow").clicked() { self.current=parent.unwrap_or(0); }
+                if ui.add_enabled(parent.is_some(),egui::Button::new("←")).on_hover_text("Previous move · Left arrow").clicked() { self.current=step_back(replay, self.current, self.play.as_ref().filter(|p| p.train.is_none()).map(|p| p.settings.human)); }
                 ui.label(format!("{move_number} / {line_length}"));
                 if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
                 if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
@@ -2392,21 +2456,21 @@ impl eframe::App for App {
                 self.error = Some(format!("The library folder is saved, but ChessLib could not restart: {e}. Quit and open it again."));
             }
         }
-        let jump_opened = self.board_editor.is_none() && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
-        if self.board_editor.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+        let jump_opened = self.board_editor.is_none() && !self.engine_settings_open && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+        if self.board_editor.is_none() && !self.engine_settings_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.choose_import(ctx);
         }
-        if self.board_editor.is_none() && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+        if self.board_editor.is_none() && !self.engine_settings_open && self.play.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
             self.new_board();
         }
-        if self.board_editor.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+        if self.board_editor.is_none() && !self.engine_settings_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
         if jump_opened {
             self.jump = Some((String::new(), library::jump(&self.db, "").unwrap_or_default(), 0));
         }
         let plain = |key| ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key));
-        if self.board_editor.is_none() && !ctx.wants_keyboard_input() {
+        if self.board_editor.is_none() && !self.engine_settings_open && !ctx.wants_keyboard_input() {
             if plain(egui::Key::F) {
                 self.flip();
             }
@@ -2416,6 +2480,7 @@ impl eframe::App for App {
             if plain(egui::Key::L) && self.engine_path.is_some() {
                 self.continuous = !self.continuous;
                 self.analysis = None;
+                self.lines.clear();
                 self.analysis_error = None;
             }
             // Space plays the engine's top move, like "Play best", while analysis runs outside play/training.
@@ -2428,14 +2493,14 @@ impl eframe::App for App {
                 self.play(best);
             }
         }
-        if self.board_editor.is_none() && !ctx.wants_keyboard_input()
+        if self.board_editor.is_none() && !self.engine_settings_open && !ctx.wants_keyboard_input()
             && let Some(replay) = &self.replay
         {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                 self.current = replay.next(self.current).unwrap_or(self.current);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                self.current = replay.nodes[self.current].parent.unwrap_or(0);
+                self.current = step_back(replay, self.current, self.play.as_ref().filter(|p| p.train.is_none()).map(|p| p.settings.human));
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::ArrowUp)) {
                 self.current = 0;
@@ -2456,11 +2521,11 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        if self.board_editor.is_none() && !drops.is_empty() {
+        if self.board_editor.is_none() && !self.engine_settings_open && !drops.is_empty() {
             self.import_files(drops, ctx);
         }
         // ⌘V outside a text field imports pasted PGN or FEN (a FEN on the analysis board sets it up instead); the importer reads files, so stage it in one.
-        let pasted = if self.board_editor.is_some() || ctx.wants_keyboard_input() || self.importing { None } else {
+        let pasted = if self.board_editor.is_some() || self.engine_settings_open || ctx.wants_keyboard_input() || self.importing { None } else {
             ctx.input(|i| i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) if !text.trim().is_empty() => Some(text.clone()),
                 _ => None,
@@ -2664,6 +2729,7 @@ impl eframe::App for App {
                 self.train_setup = false;
             }
         }
+        self.engine_settings(ctx);
         if let Some((edit, mut name)) = self.folder_edit.take() {
             let (mut save, mut cancel) = (false, false);
             let modal = egui::Modal::new(egui::Id::new("folder")).show(ctx, |ui| {
@@ -2908,6 +2974,17 @@ impl BoardSound {
     }
 }
 
+/// The position before `id`; against the computer, back to the player's previous turn so they can play on from it.
+fn step_back(replay: &Replay, id: usize, human: Option<Color>) -> usize {
+    let mut node = replay.nodes[id].parent.unwrap_or(0);
+    while let Some(parent) = replay.nodes[node].parent
+        && human.is_some_and(|human| replay.nodes[node].position.as_ref().is_some_and(|p| p.turn() != human))
+    {
+        node = parent;
+    }
+    node
+}
+
 fn move_sound(replay: &Replay, previous: usize, current: usize) -> Option<BoardSound> {
     let node = &replay.nodes[current];
     node.position.as_ref()?;
@@ -2960,7 +3037,51 @@ fn material(painter: &egui::Painter, cloth: &egui::TextureHandle, rect: egui::Re
     painter.image(cloth.id(), rect, uv, color);
 }
 
-/// Soft shadow falling inward from the top edge, as under a book cover or a lifted page.
+fn analysis_toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(28.0, 24.0), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "Continuous analysis"));
+    let visuals = ui.style().interact_selectable(&response, *on);
+    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(28.0, 16.0));
+    ui.painter().rect(track, 8.0, if *on { GREEN } else { visuals.bg_fill }, visuals.bg_stroke, egui::StrokeKind::Inside);
+    let x = if *on { track.right() - 8.0 } else { track.left() + 8.0 };
+    ui.painter().circle_filled(egui::pos2(x, track.center().y), 5.0, PAPER);
+    response
+}
+
+#[cfg(test)]
+#[test]
+fn analysis_toggle_clicks_and_disabled_state() {
+    let ctx = egui::Context::default();
+    let mut on = false;
+    let mut frame = |events, enabled| {
+        let mut response = None;
+        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                response = Some(ui.add_enabled(enabled, |ui: &mut egui::Ui| analysis_toggle(ui, &mut on)));
+            });
+        });
+        (response.unwrap(), on)
+    };
+    let (response, _) = frame(vec![], true);
+    let pos = response.rect.center();
+    let click = || vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ];
+    let (response, on) = frame(click(), true);
+    assert!(response.changed() && on);
+    let (response, on) = frame(click(), false);
+    assert!(!response.changed() && on);
+    frame(vec![], true);
+    let (response, on) = frame(click(), true);
+    assert!(response.changed() && !on);
+}
+
 /// A study-desk section: rule, bold title, and quiet status on the right.
 fn section(ui: &mut egui::Ui, title: impl Into<String>, meta: &str) {
     ui.add_space(6.0);
@@ -3247,11 +3368,9 @@ impl Sheet<'_> {
     /// The PGN's comments after a move, in the reader's grey; returns whether there were any.
     fn comments(&self, ui: &mut egui::Ui, id: usize) -> bool {
         let mut any = false;
-        for annotation in &self.replay.nodes[id].annotations {
-            if let Token::Comment(text) = annotation {
-                ui.label(RichText::new(text.trim()).size(12.5).italics().color(MUTED));
-                any = true;
-            }
+        for text in self.replay.comments(id) {
+            ui.label(RichText::new(text).size(12.5).italics().color(MUTED));
+            any = true;
         }
         any
     }
@@ -3309,6 +3428,10 @@ impl Sheet<'_> {
         if note.is_some() {
             add(target, RichText::new(" •").color(RIBBON));
         }
+        // The clock left after the move, as Lichess exports record it; the hour goes while it is zero.
+        if let Some(clock) = replay.command(id, "clk").filter(|_| !side) {
+            add(&mut signs, RichText::new(format!("  {}", clock.strip_prefix("0:").unwrap_or(clock))).size(11.0).color(MUTED));
+        }
         let mut button = egui::Button::selectable(self.current == id, job);
         if let Some(cell) = cell {
             button = button.min_size(cell).right_text(signs);
@@ -3359,12 +3482,21 @@ impl Sheet<'_> {
             let parent = node.parent.unwrap();
             let first = replay.nodes[parent].children[0];
             let promotable = first != id && !replay.in_game(first) && node.position.is_some();
+            let branches = replay.branches_to(id);
+            let to_main = node.position.is_some() && !branches.is_empty();
             let added = id >= self.first_added;
-            if promotable || added {
+            if promotable || to_main || added {
                 ui.separator();
             }
-            if promotable && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
+            // When this branch is the only one in the way, promoting it already makes the main line.
+            if promotable && branches != [id] && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
                 loaded.game.promote(replay, id);
+                self.rebuild = true;
+            }
+            if to_main
+                && ui.button("Set as main line").on_hover_text("Make this whole line the main line. If it replaces the game's own moves, those become a side line.").clicked()
+            {
+                self.next = loaded.game.set_main_line(replay, &mut loaded.notes, id).unwrap_or(id);
                 self.rebuild = true;
             }
             if added && ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
@@ -3395,9 +3527,13 @@ impl Sheet<'_> {
 
 /// The scoresheet's rows, with the comments and side lines that break them, for the game's main line.
 fn scoresheet(replay: &Replay) -> Vec<Entry> {
-    let main = replay.line(0);
+    let mut main = replay.line(0);
+    // Analysis played on from the game's last move continues the columns, so a fresh board's moves are not a side line.
+    while let Some(next) = replay.next(*main.last().unwrap()) {
+        main.push(next);
+    }
     let last = *main.last().unwrap();
-    let commented = |id: usize| replay.nodes[id].annotations.iter().any(|t| matches!(t, Token::Comment(_)));
+    let commented = |id: usize| replay.comments(id).next().is_some();
     let mut entries = Vec::new();
     if commented(0) {
         entries.push(Entry::Comment(0));
@@ -3430,7 +3566,7 @@ fn scoresheet(replay: &Replay) -> Vec<Entry> {
         }
     }
     entries.extend(row.take().map(|(n, w, b)| Entry::Row(n, w, b)));
-    // Analysis that continues past the game's last move.
+    // A first move after the end that the board cannot play.
     if !replay.nodes[last].children.is_empty() {
         entries.push(Entry::Branches(last, None));
     }
@@ -3507,9 +3643,10 @@ fn move_destination(movement: Move) -> Square {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pgn::Token;
 
     #[test]
-    fn scoresheet_breaks_rows_for_side_lines_comments_and_later_analysis() {
+    fn scoresheet_breaks_rows_for_side_lines_and_comments_and_continues_into_analysis() {
         // 1. e4 (1. d4) e5 (1... c5 2. Nf3) 2. Nf3 {Develops.} Nc6, then the reader's 3. Bb5.
         let m = |san: &str| Token::Move(san.into());
         let mut game = Game::default();
@@ -3526,7 +3663,7 @@ mod tests {
                 Entry::Row(2, Some(3), None),
                 Entry::Comment(3),
                 Entry::Row(2, None, Some(4)),
-                Entry::Branches(4, None),
+                Entry::Row(3, Some(8), None),
             ]
         );
     }
@@ -3581,6 +3718,22 @@ mod tests {
         let imported = pgn_reader::Reader::new(exported.as_bytes()).read_game(&mut crate::pgn::Parser).unwrap().unwrap().unwrap();
         assert_eq!(imported.tag("FEN"), fen);
         assert_eq!(imported.mainline_positions().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stepping_back_against_the_computer_lands_on_the_players_turn() {
+        let mut game = Game::default();
+        let mut replay = game.replay().unwrap();
+        let mut id = 0;
+        for san in ["e4", "e5", "Nf3", "Nc6"] {
+            let position = replay.nodes[id].position.clone().unwrap();
+            id = game.play(&mut replay, id, san.parse::<shakmaty::san::San>().unwrap().to_move(&position).unwrap()).unwrap();
+        }
+        assert_eq!(step_back(&replay, 4, None), 3);
+        assert_eq!(step_back(&replay, 4, Some(Color::White)), 2);
+        assert_eq!(step_back(&replay, 3, Some(Color::White)), 2);
+        // Black has no earlier turn than after 1.e4, so stepping back reaches the start.
+        assert_eq!(step_back(&replay, 1, Some(Color::Black)), 0);
     }
 
     #[test]
@@ -3878,8 +4031,7 @@ fn game_card(ui: &mut egui::Ui, row: &library::Row, selected: bool) -> egui::Res
         card_text(&painter, text, size, color, max_width, max_rows)
     };
     let reserve = if row.starred { 20.0 } else { 0.0 } + if show_result { 63.0 } else { 0.0 };
-    let bold = egui::FontId::new(15.0, egui::FontFamily::Name("bold".into()));
-    let title_line = titled.then(|| card_text_in(&painter, &row.title, bold, INK, width - 26.0 - reserve, 2));
+    let title_line = titled.then(|| layout(&row.title, 15.0, INK, width - 26.0 - reserve, 2));
     let event_line = (!titled || known(&row.event)).then(|| layout(event, 11.5, MUTED, width - 26.0, 2));
     let title_height = title_line.as_ref().map_or(0.0, |g| g.size().y + 4.0);
     let names_height = if show_names { 36.0 } else { 0.0 };

@@ -286,9 +286,14 @@ pub fn load(db: &Connection, id: i64) -> Result<Loaded> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let mut game: Game = serde_json::from_str(&body)?;
+    // Evaluations the PGN brought, as Lichess exports carry, stand in until Stockfish reviews the game.
+    if game.review.is_none() {
+        game.review = game.pgn_review();
+    }
     Ok(Loaded {
         id,
-        game: serde_json::from_str(&body)?,
+        game,
         notes: serde_json::from_str(&notes)?,
         starred,
     })
@@ -343,7 +348,7 @@ pub fn mistakes(db: &Connection, game: Option<i64>, player: &str) -> Result<Vec<
         let body = body?;
         let game: Game = serde_json::from_str(&body)?;
         let (Some(review), Ok(positions), Ok(replay)) = (&game.review, game.mainline_positions(), game.replay()) else { continue };
-        for m in review.moves.iter().filter(|m| m.quality == crate::engine::Quality::Blunder) {
+        for m in review.moves.iter().filter(|m| m.quality == crate::engine::Quality::Blunder && !m.best.is_empty()) {
             let name = game.tag(if m.white { "White" } else { "Black" }).to_lowercase();
             let Some(i) = positions.iter().position(|(node, _)| *node == m.node) else { continue };
             if i == 0 || !words.iter().all(|w| name.contains(w.as_str())) {

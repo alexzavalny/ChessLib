@@ -319,7 +319,7 @@ fn classify(
     before: &Evaluation,
     after: &Evaluation,
     white: bool,
-    movement: Move,
+    best: bool,
 ) -> (Quality, f64, f64) {
     let loss =
         ((before.white_chance - after.white_chance) * if white { 1.0 } else { -1.0 }).max(0.0);
@@ -335,12 +335,59 @@ fn classify(
         Quality::Mistake
     } else if loss >= 5.0 {
         Quality::Inaccuracy
-    } else if before.best == Some(movement) {
+    } else if best {
         Quality::Best
     } else {
         Quality::Good
     };
     (quality, accuracy, loss)
+}
+
+/// White's winning chances in percent for an evaluation in centipawns from White's side.
+fn win_chance(centipawns: f64) -> f64 {
+    100.0 / (1.0 + (-0.00368208 * centipawns).exp())
+}
+
+/// An evaluation as a PGN comment carries it, Lichess's `[%eval 0.18]` or `[%eval #-3]`: White's side, maybe `,depth` after.
+pub fn pgn_eval(value: &str) -> Option<Evaluation> {
+    let (value, depth) = value.split_once(',').unwrap_or((value, "0"));
+    let (score, white_chance) = match value.strip_prefix('#') {
+        Some(mate) => {
+            let mate: i32 = mate.parse().ok()?;
+            (format!("Mate {mate:+}"), if mate > 0 { 100.0 } else { 0.0 })
+        }
+        None => {
+            let pawns: f64 = value.parse().ok()?;
+            (format!("{pawns:+.2}"), win_chance(pawns * 100.0))
+        }
+    };
+    Some(Evaluation { score, depth: depth.parse().unwrap_or(0), line: String::new(), best: None, white_chance, multipv: 1 })
+}
+
+/// A review from the evaluations a PGN carries after each move of `positions` (the main line), as Lichess exports them;
+/// None unless every move has one, a final mate aside. They name no best move, so no move rates Best.
+pub fn pgn_report(positions: &[(usize, Chess)], eval: impl Fn(usize) -> Option<Evaluation>) -> Option<Report> {
+    // Lichess rates the standard start +0.2; another start counts from the first move's evaluation.
+    let mut before = (positions.first()?.1 == Chess::default()).then(|| pgn_eval("0.2")).flatten();
+    let mut report = Report { moves: vec![], milliseconds_per_position: 0 };
+    for (i, pair) in positions.windows(2).enumerate() {
+        let (node, position) = &pair[1];
+        // Lichess leaves the mating move unevaluated.
+        let mate = || {
+            let white_won = position.turn() == Color::Black;
+            (i + 2 == positions.len() && position.is_checkmate()).then(|| Evaluation {
+                score: "Checkmate".into(),
+                white_chance: if white_won { 100.0 } else { 0.0 },
+                ..pgn_eval("0").unwrap()
+            })
+        };
+        let after = eval(*node).or_else(mate)?;
+        let white = pair[0].1.turn() == Color::White;
+        let (quality, accuracy, loss) = classify(before.as_ref().unwrap_or(&after), &after, white, false);
+        report.moves.push(ReviewedMove { node: *node, white, quality, accuracy, loss, score: after.score.clone(), best: String::new(), depth: after.depth });
+        before = Some(after);
+    }
+    (!report.moves.is_empty()).then_some(report)
 }
 
 fn review(
@@ -389,7 +436,7 @@ fn review(
             |_| {},
         )?;
         let white = previous.turn() == Color::White;
-        let (quality, accuracy, loss) = classify(&before, &after, white, movement);
+        let (quality, accuracy, loss) = classify(&before, &after, white, before.best == Some(movement));
         report.moves.push(ReviewedMove {
             node: *node,
             white,
@@ -480,7 +527,7 @@ fn parse_info(line: &str, position: &Chess) -> Option<Evaluation> {
         line: moves.join(" "),
         best,
         white_chance: if kind == "cp" {
-            100.0 / (1.0 + (-0.00368208 * f64::from(white_value)).exp())
+            win_chance(f64::from(white_value))
         } else if white_value > 0 || (value == 0 && position.turn() == Color::Black) {
             100.0
         } else {
@@ -582,7 +629,7 @@ mod tests {
     fn review_metrics_respect_side_thresholds_and_empty_sides() {
         let pos = Chess::default();
         let movement = "e2e4".parse::<UciMove>().unwrap().to_move(&pos).unwrap();
-        let mut before = Evaluation {
+        let before = Evaluation {
             score: "0.00".into(),
             depth: 12,
             line: "e4".into(),
@@ -599,7 +646,7 @@ mod tests {
         ] {
             let mut after = before.clone();
             after.white_chance -= loss;
-            let (got, accuracy, actual_loss) = classify(&before, &after, true, movement);
+            let (got, accuracy, actual_loss) = classify(&before, &after, true, true);
             assert_eq!(got, quality);
             assert!((actual_loss - loss).abs() < 1e-9);
             assert!((0.0..=100.0).contains(&accuracy));
@@ -607,12 +654,11 @@ mod tests {
         let mut after = before.clone();
         after.white_chance = 75.0;
         assert_eq!(
-            classify(&before, &after, false, movement).0,
+            classify(&before, &after, false, true).0,
             Quality::Blunder
         );
-        assert_eq!(classify(&before, &after, true, movement).1, 100.0);
-        before.best = None;
-        assert_eq!(classify(&before, &before, true, movement).0, Quality::Good);
+        assert_eq!(classify(&before, &after, true, true).1, 100.0);
+        assert_eq!(classify(&before, &before, true, false).0, Quality::Good);
         let report = Report {
             moves: vec![ReviewedMove {
                 node: 1,

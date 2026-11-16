@@ -115,7 +115,7 @@ impl Game {
                 _ => {}
             }
         }
-        // Main-line IDs remain the old note indices; imported tokens never change.
+        // Main-line IDs come first, so they remain the old note indices.
         let root = Node {
             position: Some(initial),
             parent: None,
@@ -210,6 +210,76 @@ impl Game {
         true
     }
 
+    /// Makes `id`'s line the main line and returns `id`'s node afterwards; None when it is already on it or is illegal.
+    /// Where a move played in the game is in the way, the game is rewritten: the line becomes the game's moves and the old
+    /// ones a side line, nodes renumber with notes, marks, drawings, bookmarks and tags following their moves, and a
+    /// whole-game review, which no longer fits, is dropped.
+    pub fn set_main_line(&mut self, replay: &Replay, notes: &mut Notes, id: usize) -> Option<usize> {
+        let branches = replay.branches_to(id);
+        if replay.nodes[id].position.is_none() || branches.is_empty() {
+            return None;
+        }
+        let first_of = |n: usize| replay.nodes[replay.nodes[n].parent.unwrap()].children[0];
+        if !branches.iter().any(|&n| replay.in_game(first_of(n))) {
+            for n in branches {
+                self.promote(replay, n);
+            }
+            return Some(id);
+        }
+        // The new main line: the way to `id`, then on through each first move.
+        let mut main = vec![id];
+        while let Some(parent) = replay.nodes[*main.last().unwrap()].parent {
+            main.push(parent);
+        }
+        main.reverse();
+        while let Some(&child) = replay.nodes[*main.last().unwrap()].children.first() {
+            main.push(child);
+        }
+        let base = self.first_added(replay);
+        let mut on_main = vec![false; replay.nodes.len()];
+        let mut ids = vec![None; replay.nodes.len()];
+        for (new, &old) in main.iter().enumerate() {
+            on_main[old] = true;
+            ids[old] = Some(new);
+        }
+        // The game's moves and the new main line become the PGN moves, the main line first at every branch.
+        let order = |n: usize| {
+            let mut kids: Vec<usize> = replay.nodes[n].children.iter().copied().filter(|&c| c < base || on_main[c]).collect();
+            kids.sort_by_key(|&c| !on_main[c]);
+            kids
+        };
+        let mut next = main.len();
+        let mut tokens = replay.nodes[0].annotations.clone();
+        write_tokens(replay, &order, 0, &mut ids, &mut next, &mut tokens);
+        let moves_end = next;
+        let mut study = Vec::new();
+        for (i, movement) in self.study.iter().enumerate() {
+            if ids[base + i].is_none() {
+                ids[base + i] = Some(next);
+                next += 1;
+                study.push(StudyMove { parent: ids[movement.parent].unwrap(), san: movement.san.clone() });
+            }
+        }
+        debug_assert_eq!(next, replay.nodes.len());
+        self.tokens = tokens;
+        self.study = study;
+        self.renumber(notes, |old| ids[old]);
+        // Orders among the game's moves are now written into them.
+        self.promoted.retain(|_, child| *child >= moves_end);
+        self.review = None;
+        ids[id]
+    }
+
+    /// Moves what the reader keeps per node to the node's new number; `map` gives None for a removed node.
+    fn renumber(&mut self, notes: &mut Notes, map: impl Fn(usize) -> Option<usize>) {
+        *notes = std::mem::take(notes).into_iter().filter_map(|(k, v)| Some((map(k)?, v))).collect();
+        self.drawings = std::mem::take(&mut self.drawings).into_iter().filter_map(|(k, v)| Some((map(k)?, v))).collect();
+        self.glyphs = std::mem::take(&mut self.glyphs).into_iter().filter_map(|(k, v)| Some((map(k)?, v))).collect();
+        self.bookmarks = std::mem::take(&mut self.bookmarks).into_iter().filter_map(&map).collect();
+        self.position_labels = std::mem::take(&mut self.position_labels).into_iter().filter_map(|(k, v)| Some((map(k)?, v))).collect();
+        self.promoted = std::mem::take(&mut self.promoted).into_iter().filter_map(|(p, c)| Some((map(p)?, map(c)?))).collect();
+    }
+
     /// Removes an added line from `id` onward, with its notes, marks and drawings; IDs of later added moves shift down.
     pub fn delete_line(&mut self, replay: &Replay, notes: &mut Notes, id: usize) -> bool {
         let base = self.first_added(replay);
@@ -240,15 +310,7 @@ impl Game {
         for movement in &mut self.study {
             movement.parent = remap(movement.parent).unwrap();
         }
-        *notes = std::mem::take(notes).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
-        self.drawings = std::mem::take(&mut self.drawings).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
-        self.glyphs = std::mem::take(&mut self.glyphs).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
-        self.bookmarks = std::mem::take(&mut self.bookmarks).into_iter().filter_map(remap).collect();
-        self.position_labels = std::mem::take(&mut self.position_labels).into_iter().filter_map(|(k, v)| Some((remap(k)?, v))).collect();
-        self.promoted = std::mem::take(&mut self.promoted)
-            .into_iter()
-            .filter_map(|(p, c)| Some((remap(p)?, remap(c)?)))
-            .collect();
+        self.renumber(notes, remap);
         true
     }
 
@@ -274,6 +336,15 @@ impl Game {
             }
         }
         Ok(positions)
+    }
+
+    /// A review from the `[%eval]` values the PGN's main line carries, as Lichess exports have; see `engine::pgn_report`.
+    pub fn pgn_review(&self) -> Option<crate::engine::Report> {
+        if !self.tokens.iter().any(|t| matches!(t, Token::Comment(c) if c.contains("[%eval "))) {
+            return None;
+        }
+        let replay = self.replay().ok()?;
+        crate::engine::pgn_report(&self.mainline_positions().ok()?, |n| replay.command(n, "eval").and_then(crate::engine::pgn_eval))
     }
 
     pub fn play(&mut self, replay: &mut Replay, parent: usize, movement: Move) -> Result<usize> {
@@ -420,6 +491,42 @@ pub struct Replay {
     game_len: usize,
 }
 
+/// A comment without its `[%…]` commands (clocks, evaluations, drawings), trimmed; an unclosed one stays.
+fn without_commands(comment: &str) -> String {
+    let (mut text, mut rest) = (String::new(), comment);
+    while let Some((before, after)) = rest.split_once("[%").and_then(|(b, a)| Some((b, a.split_once(']')?.1))) {
+        text.push_str(before);
+        rest = after;
+    }
+    text.push_str(rest);
+    text.trim().to_owned()
+}
+
+/// Writes the moves after `node` as PGN tokens, `order`'s first child continuing and the rest as variations, and numbers
+/// each new node in the order the parser will; nodes that already have a number keep it.
+fn write_tokens(replay: &Replay, order: &dyn Fn(usize) -> Vec<usize>, mut node: usize, ids: &mut [Option<usize>], next: &mut usize, tokens: &mut Vec<Token>) {
+    fn put(replay: &Replay, n: usize, ids: &mut [Option<usize>], next: &mut usize, tokens: &mut Vec<Token>) {
+        ids[n].get_or_insert_with(|| {
+            *next += 1;
+            *next - 1
+        });
+        tokens.push(Token::Move(replay.nodes[n].san.clone()));
+        tokens.extend(replay.nodes[n].annotations.iter().cloned());
+    }
+    loop {
+        let kids = order(node);
+        let Some((&first, others)) = kids.split_first() else { return };
+        put(replay, first, ids, next, tokens);
+        for &other in others {
+            tokens.push(Token::Open);
+            put(replay, other, ids, next, tokens);
+            write_tokens(replay, order, other, ids, next, tokens);
+            tokens.push(Token::Close);
+        }
+        node = first;
+    }
+}
+
 impl Replay {
     fn node_after(&self, parent: usize, san: &str) -> Node {
         let position = self.nodes[parent].position.as_ref().and_then(|pos| {
@@ -436,6 +543,19 @@ impl Replay {
             annotations: vec![],
             ply: self.nodes[parent].ply + 1,
         }
+    }
+
+    /// The moves on the way to `id` that are not their parent's first choice, deepest first; empty on the main line.
+    pub fn branches_to(&self, id: usize) -> Vec<usize> {
+        let mut branches = Vec::new();
+        let mut node = id;
+        while let Some(parent) = self.nodes[node].parent {
+            if self.nodes[parent].children[0] != node {
+                branches.push(node);
+            }
+            node = parent;
+        }
+        branches
     }
 
     pub fn next(&self, id: usize) -> Option<usize> {
@@ -475,6 +595,23 @@ impl Replay {
             + usize::from(initial.turn().is_black())
             + self.nodes[id].ply
             - 1
+    }
+
+    /// The move's PGN comments as the reader sees them: without `[%…]` commands, and none that held only commands.
+    pub fn comments(&self, id: usize) -> impl Iterator<Item = String> + '_ {
+        self.nodes[id].annotations.iter().filter_map(|t| match t {
+            Token::Comment(c) => Some(without_commands(c)).filter(|c| !c.is_empty()),
+            _ => None,
+        })
+    }
+
+    /// The value of a `[%name value]` command in the move's comments, such as Lichess's `clk` and `eval`.
+    pub fn command(&self, id: usize, name: &str) -> Option<&str> {
+        let tag = format!("[%{name} ");
+        self.nodes[id].annotations.iter().find_map(|t| match t {
+            Token::Comment(c) => Some(c[c.find(&tag)? + tag.len()..].split(']').next()?.trim()),
+            _ => None,
+        })
     }
 
     /// The move's mark as a NAG 1–6: the reader's own, else the first imported one.
@@ -779,6 +916,73 @@ mod tests {
         assert_eq!(game.position_labels.keys().copied().collect::<Vec<_>>(), vec![d5], "position tags follow their move");
         assert!(game.promoted.is_empty());
         assert!(!game.export(&notes).unwrap().contains("d5"));
+    }
+
+    #[test]
+    fn lichess_evaluations_and_clocks() {
+        // Lichess writes the evaluation and clock in one comment or several, and leaves the mating move unevaluated.
+        let game = parse("1. e4 { [%eval 0.18] [%clk 0:29:54] } e5 { [%eval 0.2] } { Book. } { [%clk 0:30:11] } 2. Qh5 { [%eval #-3] } Ke7 { [%eval #1] } 3. Qxe5# { [%clk 1:02:03.5] } 1-0");
+        let replay = game.replay().unwrap();
+        assert_eq!((replay.command(1, "clk"), replay.command(2, "clk"), replay.command(3, "clk")), (Some("0:29:54"), Some("0:30:11"), None));
+        assert_eq!(replay.comments(1).count(), 0);
+        assert_eq!(replay.comments(2).collect::<Vec<_>>(), ["Book."]);
+        assert_eq!(without_commands("a [%cal Ge2e4] b [%unclosed"), "a  b [%unclosed");
+        let report = game.pgn_review().unwrap();
+        let summary: Vec<_> = report.moves.iter().map(|m| (m.node, m.score.as_str(), m.quality)).collect();
+        use crate::engine::Quality::*;
+        assert_eq!(summary, [(1, "+0.18", Good), (2, "+0.20", Good), (3, "Mate -3", Blunder), (4, "Mate +1", Blunder), (5, "Checkmate", Good)]);
+        assert!(game.export(&Notes::new()).unwrap().contains("[%clk 0:29:54]"), "export keeps them");
+        assert!(parse("1. e4 { [%eval 0.18] } e5 2. Nf3 { [%eval 0.2] } *").pgn_review().is_none(), "a move without one");
+        assert!(parse("1. e4 e5 *").pgn_review().is_none());
+    }
+
+    #[test]
+    fn set_main_line_promotes_added_branches() {
+        let mut game = parse("1. e4 e5 *");
+        let mut replay = game.replay().unwrap();
+        let nf3 = play_san(&mut game, &mut replay, 2, "Nf3");
+        play_san(&mut game, &mut replay, nf3, "Nc6");
+        let bc4 = play_san(&mut game, &mut replay, 2, "Bc4");
+        play_san(&mut game, &mut replay, bc4, "Nf6");
+        let bc5 = play_san(&mut game, &mut replay, bc4, "Bc5");
+        let tokens = format!("{:?}", game.tokens);
+        assert_eq!(game.set_main_line(&replay, &mut Notes::new(), nf3), None, "already the main line");
+        assert_eq!(game.set_main_line(&replay, &mut Notes::new(), bc5), Some(bc5));
+        let replay = game.replay().unwrap();
+        assert_eq!(replay.nodes[2].children, vec![bc4, nf3]);
+        assert_eq!(replay.nodes[bc4].children[0], bc5);
+        assert_eq!(format!("{:?}", game.tokens), tokens, "past the game's end only the order changes");
+    }
+
+    #[test]
+    fn set_main_line_over_the_game_rewrites_it_and_keeps_notes_on_their_moves() {
+        // Nodes: 1 e4, 2 e5, 3 Nf3, 4 Nc6, 5 c5, 6 Nf3; added 7 e6, 8 d4, 9 Nf3, 10 Bb5.
+        let mut game = parse("1. e4 e5 {Open} (1... c5 2. Nf3) 2. Nf3 Nc6 *");
+        let mut replay = game.replay().unwrap();
+        let e6 = play_san(&mut game, &mut replay, 1, "e6");
+        let d4 = play_san(&mut game, &mut replay, e6, "d4");
+        play_san(&mut game, &mut replay, e6, "Nf3");
+        let bb5 = play_san(&mut game, &mut replay, 4, "Bb5");
+        let mut notes = Notes::from([(2, "e5".into()), (d4, "French".into()), (bb5, "later".into())]);
+        game.glyphs.insert(e6, 1);
+        game.bookmarks.insert(6);
+        game.position_labels.insert(d4, ["Tag".to_owned()].into());
+        assert_eq!(game.set_main_line(&replay, &mut notes, d4), Some(3));
+        let replay = game.replay().unwrap();
+        let sans = |r: &Replay, line: Vec<usize>| line.iter().skip(1).map(|&n| r.nodes[n].san.clone()).collect::<Vec<_>>();
+        assert_eq!(sans(&replay, replay.line(0)), ["e4", "e6", "d4"]);
+        assert!(replay.in_game(3) && replay.nodes[4].san == "e5");
+        assert!(replay.nodes[4].annotations.iter().any(|t| matches!(t, Token::Comment(c) if c == "Open")));
+        assert_eq!(notes, Notes::from([(3, "French".into()), (4, "e5".into()), (10, "later".into())]));
+        assert_eq!((game.glyphs.get(&2), game.bookmarks.iter().next(), game.position_labels.contains_key(&3)), (Some(&1), Some(&8), true));
+        assert_eq!((replay.nodes[9].san.as_str(), replay.nodes[9].parent), ("Nf3", Some(2)), "the other added move stays added");
+        assert_eq!((replay.nodes[10].san.as_str(), replay.nodes[10].parent), ("Bb5", Some(6)));
+        assert_eq!(game.first_added(&replay), 9);
+        // And back: the old game's line is the main line again, now with 2... Bb5 played on.
+        assert_eq!(game.set_main_line(&replay, &mut notes, 6), Some(4));
+        let replay = game.replay().unwrap();
+        assert_eq!(sans(&replay, replay.line(0)), ["e4", "e5", "Nf3", "Nc6", "Bb5"]);
+        assert_eq!(notes.get(&2).map(String::as_str), Some("e5"));
     }
 
     #[test]
