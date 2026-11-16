@@ -4,8 +4,8 @@ use crate::{
     pgn::{Game, Replay},
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
-use objc2::{AnyThread, rc::Retained};
-use objc2_app_kit::NSSound;
+use objc2::{AnyThread, MainThreadMarker, rc::Retained, sel};
+use objc2_app_kit::{NSApplication, NSSound};
 use objc2_foundation::{NSData, NSString, NSUserDefaults, ns_string};
 use shakmaty::{Color, EnPassantMode, Move, Piece, Position, Role, Setup, Square, fen::Fen};
 use std::{
@@ -40,6 +40,18 @@ struct PlaySettings {
 /// What the "Play vs computer" dialog starts with, from its button or P.
 const NEW_PLAY: PlaySettings = PlaySettings { human: Color::White, level: 5, show_evaluation: true };
 
+/// What leaves the open game, held while the "Save changes?" dialog asks about unsaved edits.
+#[derive(Clone, Copy)]
+enum Leave {
+    Select(i64),
+    NewBoard,
+    Play(PlaySettings),
+    Train(Option<i64>),
+    Export(bool),
+    LibraryFolder,
+    Close,
+}
+
 /// A game against Stockfish, kept in memory and never saved to the library.
 struct Play {
     settings: PlaySettings,
@@ -60,6 +72,18 @@ struct Train {
 
 /// The library's file name inside its folder.
 pub const LIBRARY_FILE: &str = "library.sqlite3";
+
+/// Points ⌘Q at the window's close button, which asks about unsaved edits; winit's Quit calls
+/// terminate:, which quits without asking.
+fn quit_by_closing() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(menu) = NSApplication::sharedApplication(mtm).mainMenu().and_then(|m| m.itemAtIndex(0)?.submenu()) else { return };
+    // SAFETY: both are AppKit's own selectors, and a nil target is any menu item's default.
+    let quit = unsafe { menu.indexOfItemWithTarget_andAction(None, Some(sel!(terminate:))) };
+    if let Some(item) = (quit >= 0).then(|| menu.itemAtIndex(quit)).flatten() {
+        unsafe { item.setAction(Some(sel!(performClose:))) };
+    }
+}
 
 /// The folder chosen with "Library folder…", if any.
 pub fn saved_library_folder() -> Option<PathBuf> {
@@ -112,6 +136,8 @@ pub struct App {
     train_setup: bool,
     /// The game awaiting delete confirmation: id and "White — Black".
     delete_game: Option<(i64, String)>,
+    /// The move awaiting "Delete from here" confirmation.
+    delete_from: Option<usize>,
     /// The folder name dialog: a new folder under the parent (None for top level), or a rename, with the typed name.
     folder_edit: Option<(FolderEdit, String)>,
     /// Folders shown closed in the sidebar tree.
@@ -185,8 +211,10 @@ pub struct App {
     review_game: Option<i64>,
     review_progress: (usize, usize),
     review_error: Option<String>,
+    /// The open game has edits that are not saved yet; only Save (⌘S) writes them.
     dirty: bool,
-    edited: Instant,
+    /// The action waiting on the "Save changes?" dialog.
+    leaving: Option<Leave>,
     status: String,
     error: Option<String>,
     importing: bool,
@@ -306,6 +334,7 @@ impl App {
             play_setup: None,
             train_setup: false,
             delete_game: None,
+            delete_from: None,
             folder_edit: None,
             collapsed: HashSet::new(),
             import_folder: None,
@@ -374,7 +403,7 @@ impl App {
             review_progress: (0, 0),
             review_error: None,
             dirty: false,
-            edited: Instant::now(),
+            leaving: None,
             status: "Your chess, thoughtfully organised.".into(),
             error: None,
             importing: false,
@@ -384,6 +413,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         app.refresh(false);
+        quit_by_closing();
         app
     }
     fn refresh(&mut self, reset: bool) {
@@ -420,6 +450,7 @@ impl App {
                 Ok(()) => {
                     self.dirty = false;
                     self.status = "Study work saved on this Mac".into();
+                    self.refresh(false);
                 }
                 Err(e) => {
                     self.error = Some(format!(
@@ -431,13 +462,81 @@ impl App {
         }
         true
     }
-    fn select(&mut self, id: i64) {
-        if !self.save() {
-            return;
+    /// Unsaved edits to a library game; the analysis board and play games are never saved this way.
+    fn pending(&self) -> bool {
+        self.dirty && self.play.is_none() && self.loaded.as_ref().is_some_and(|l| l.id >= 0)
+    }
+    /// True when nothing is unsaved; otherwise holds `then` for the "Save changes?" dialog to run.
+    fn leave(&mut self, then: Leave) -> bool {
+        if !self.pending() {
+            return true;
         }
+        self.leaving = Some(then);
+        false
+    }
+    /// Reopens the open game as last saved, staying on the same move when it still exists.
+    fn discard(&mut self) {
+        let Some(id) = self.loaded.as_ref().map(|l| l.id).filter(|&id| id >= 0) else { return };
+        let loaded = match library::load(&self.db, id) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.error = Some(format!("Could not reopen the saved game: {e}"));
+                return;
+            }
+        };
+        let mut path = vec![];
+        if let Some(replay) = &self.replay {
+            let mut node = self.current;
+            while let Some(parent) = replay.nodes[node].parent {
+                path.push(replay.nodes[node].san.clone());
+                node = parent;
+            }
+        }
+        self.replay = loaded.game.replay().ok();
+        self.current = 0;
+        if let Some(replay) = &self.replay {
+            for san in path.iter().rev() {
+                match replay.nodes[self.current].children.iter().find(|&&c| replay.nodes[c].san == *san) {
+                    Some(&child) => self.current = child,
+                    None => break,
+                }
+            }
+        }
+        self.flipped = loaded.game.flipped;
+        self.board_position = Some((id, self.current));
+        self.loaded = Some(loaded);
+        self.scrolled_node = None;
+        self.folded.clear();
+        self.dirty = false;
+        self.status = "Changes discarded".into();
+    }
+    /// Saves a game-level change (star, tags, flip) at once, leaving pending study edits unsaved.
+    fn save_meta(&mut self, change: impl Fn(&mut Loaded)) {
+        let Some(loaded) = &mut self.loaded else { return };
+        change(loaded);
+        let id = loaded.id;
+        if !self.dirty {
+            self.dirty = true;
+            self.save();
+        } else if self.pending() {
+            // Change the stored copy too, so a later Discard keeps it.
+            let saved = library::load(&self.db, id).and_then(|mut stored| {
+                change(&mut stored);
+                library::save(&self.db, &stored)
+            });
+            match saved {
+                Ok(()) => self.refresh(false),
+                Err(e) => self.error = Some(format!("Could not save the change: {e}")),
+            }
+        }
+    }
+    fn select(&mut self, id: i64) {
         if self.loaded.as_ref().is_some_and(|g| g.id == id) {
             self.load_seq += 1;
             self.loading = false;
+            return;
+        }
+        if !self.leave(Leave::Select(id)) {
             return;
         }
         self.load_seq += 1;
@@ -468,10 +567,7 @@ impl App {
         self.refresh(false);
     }
     fn edit_details(&mut self, id: i64, editing: bool) {
-        // Flush pending notes first: the dialog saves its own copy of the game from the database.
-        if editing && !self.save() {
-            return;
-        }
+        // The dialog saves its own copy from the database, so unsaved study edits stay unsaved.
         match library::load(&self.db, id) {
             Ok(loaded) => {
                 let known = |key: &str| {
@@ -587,6 +683,9 @@ impl App {
     }
     /// Switches to the library in a chosen folder: remembers it, then quits so main() reopens the app on it.
     fn choose_library_folder(&mut self, ctx: &egui::Context) {
+        if !self.leave(Leave::LibraryFolder) {
+            return;
+        }
         let Some(folder) = rfd::FileDialog::new()
             .set_title("Choose the folder for your library")
             .set_directory(self.path.parent().unwrap_or(&self.path))
@@ -613,7 +712,7 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     fn import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
-        if paths.is_empty() || self.importing || !self.save() {
+        if paths.is_empty() || self.importing {
             return;
         }
         self.importing = true;
@@ -643,7 +742,8 @@ impl App {
         }
     }
     fn export(&mut self, current: bool) {
-        if self.exporting || !self.save() {
+        // Export reads the library, so unsaved edits are saved or discarded first.
+        if self.exporting || !self.leave(Leave::Export(current)) {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -688,7 +788,7 @@ impl App {
                 }
                 Event::Loaded(seq, result) if seq == self.load_seq => {
                     self.loading = false;
-                    // Save edits made while the next game was loading before replacing the editor.
+                    // Leaving already asked about edits; save any typed while the next game was loading rather than lose them.
                     if !self.save() {
                         continue;
                     }
@@ -1063,7 +1163,6 @@ impl App {
                     self.promotion.clear();
                     if loaded.game.study.len() != before {
                         self.dirty = true;
-                        self.edited = Instant::now();
                     }
                 }
                 Err(e) => self.error = Some(e.to_string()),
@@ -1072,7 +1171,7 @@ impl App {
     }
 
     fn start_play(&mut self, settings: PlaySettings) {
-        if !self.save() {
+        if !self.leave(Leave::Play(settings)) {
             return;
         }
         // Drop any library game still loading so it cannot replace the new game.
@@ -1103,9 +1202,9 @@ impl App {
         self.flipped = position.is_some_and(|p| p.turn() == Color::Black);
     }
 
-    /// Leaves the open game (saving its edits) for a fresh analysis board.
+    /// Leaves the open game (asking about unsaved edits) for a fresh analysis board.
     fn new_board(&mut self) {
-        if !self.save() {
+        if !self.leave(Leave::NewBoard) {
             return;
         }
         // Drop any library game still loading so it cannot replace the new board.
@@ -1144,6 +1243,7 @@ impl App {
         self.folded.clear();
         self.loaded = Some(Loaded { id: -1, game, notes: Default::default(), starred: false });
         self.current = 0;
+        self.dirty = false;
         // Scratch boards share an id, so replacing one must invalidate its old engine result.
         self.board_position = None;
         self.analysis_position = None;
@@ -1300,7 +1400,7 @@ impl App {
             });
             return;
         }
-        if !self.save() {
+        if !self.leave(Leave::Train(game)) {
             return;
         }
         self.load_seq += 1;
@@ -1392,11 +1492,8 @@ impl App {
     /// Flips the board and remembers it with the game.
     fn flip(&mut self) {
         self.flipped = !self.flipped;
-        if let Some(loaded) = &mut self.loaded {
-            loaded.game.flipped = self.flipped;
-            self.dirty = true;
-            self.edited = Instant::now();
-        }
+        let flipped = self.flipped;
+        self.save_meta(move |l| l.game.flipped = flipped);
     }
 
     fn play_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1559,9 +1656,11 @@ impl App {
                 Ok(report) => {
                     if let Some(loaded) = &mut self.loaded {
                         loaded.game.review = Some(report);
-                        self.dirty = true;
-                        self.edited = Instant::now();
-                        self.save();
+                        // With edits pending, the review belongs to the edited moves and saves with them.
+                        if !self.dirty {
+                            self.dirty = true;
+                            self.save();
+                        }
                     }
                 }
                 Err(e) => self.review_error = Some(e.to_string()),
@@ -1867,13 +1966,16 @@ impl App {
                                         next,
                                         rebuild: false,
                                         edited: false,
+                                        delete_from: None,
                                     };
                                     sheet.show(ui);
                                     next = sheet.next;
                                     rebuild = sheet.rebuild;
                                     if sheet.edited {
                                         self.dirty = true;
-                                        self.edited = Instant::now();
+                                    }
+                                    if sheet.delete_from.is_some() {
+                                        self.delete_from = sheet.delete_from;
                                     }
                                 });
                             let main = replay.line(0);
@@ -1910,7 +2012,7 @@ impl App {
                             // The rule between moves and notes is a drag handle for the move list height.
                             ui.add_space(6.0);
                             resize_rule(ui, &mut self.moves_height, 80.0..=900.0, ns_string!("MovesHeight"));
-                            // Notes autosave shortly after typing; ⌘S saves immediately.
+                            // Notes, like moves, wait for Save (⌘S) or Discard.
                             header(ui, title, if self.dirty { "Unsaved" } else { "Saved" });
                             if let Some(loaded) = &mut self.loaded {
                                 let note = loaded.notes.entry(self.current).or_default();
@@ -1942,7 +2044,6 @@ impl App {
                                 top_shadow(ui.painter(), rect.shrink(1.0), 3);
                                 if response.changed() {
                                     self.dirty = true;
-                                    self.edited = Instant::now();
                                 }
                                 if self.current > 0 {
                                     let known = self.page.as_ref().map(|p| p.labels.as_slice()).unwrap_or_default();
@@ -1951,9 +2052,9 @@ impl App {
                                     if tags.is_empty() {
                                         loaded.game.position_labels.remove(&self.current);
                                     }
+                                    // Position tags belong to their move, so they wait for Save with it.
                                     if changed {
                                         self.dirty = true;
-                                        if self.save() { self.refresh(false); }
                                     }
                                 }
                             }
@@ -2015,8 +2116,15 @@ impl App {
                     self.save_analysis(ctx);
                 }
                 if self.play.is_none() && saved && ui.add(egui::Button::new(RichText::new(if starred { "★" } else { "☆" }).color(if starred { RIBBON } else { MUTED }))).on_hover_text("Favourite this game").clicked() {
-                    let loaded = self.loaded.as_mut().unwrap(); loaded.starred = !loaded.starred; self.dirty=true; self.edited=Instant::now();
-                    if self.save() { self.refresh(false); }
+                    self.save_meta(move |l| l.starred = !starred);
+                }
+                if self.pending() {
+                    if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(GREEN)).on_hover_text("Save your changes to this game (⌘S)").clicked() {
+                        self.save();
+                    }
+                    if ui.button("Discard").on_hover_text("Go back to the last saved version").clicked() {
+                        self.discard();
+                    }
                 }
                 if self.play.is_none() && ui.button("New board").on_hover_text("A fresh, unsaved board (⌘N)").clicked() {
                     self.new_board();
@@ -2029,8 +2137,8 @@ impl App {
                 let known = self.page.as_ref().map(|p| p.labels.as_slice()).unwrap_or_default();
                 let loaded = self.loaded.as_mut().unwrap();
                 if tag_editor(ui, &mut loaded.game.labels, known, &mut self.tag_draft, "game") {
-                    self.dirty = true;
-                    if self.save() { self.refresh(false); }
+                    let labels = loaded.game.labels.clone();
+                    self.save_meta(move |l| l.game.labels = labels.clone());
                 }
             }
             ui.add_space(14.0);
@@ -2235,7 +2343,6 @@ impl App {
                 }
                 if drawings.is_empty() { loaded.game.drawings.remove(&self.current); }
                 self.dirty = true;
-                self.edited = Instant::now();
             }
             // Returns the arrow's tail and the base of its head, for placing a label between them.
             let arrow_between = |from: Square, to: Square, color: Color32, head: f32, width: f32| {
@@ -2341,6 +2448,7 @@ impl App {
             ui.add_space(8.0);
             // Controls line up under the board's left edge.
             let below = egui::Rect::from_min_max(egui::pos2(cover.left(), ui.cursor().top()), ui.max_rect().max);
+            let mut flip = false;
             ui.scope_builder(egui::UiBuilder::new().max_rect(below), |ui| {
             let line = replay.line(self.current);
             let last = *line.last().unwrap();
@@ -2355,11 +2463,8 @@ impl App {
                 ui.label(format!("{move_number} / {line_length}"));
                 if ui.add_enabled(next.is_some(),egui::Button::new("→")).on_hover_text("Next move · Right arrow").clicked() { self.current=next.unwrap_or(self.current); }
                 if ui.add_enabled(self.current!=last,egui::Button::new("→|")).on_hover_text("Last position · End").clicked() { self.current=last; }
-                if ui.button("Flip").on_hover_text("Flip the board (F)").clicked() {
-                    // Field by field: `self.flip()` would clash with the borrowed replay.
-                    self.flipped = !self.flipped;
-                    if let Some(loaded) = &mut self.loaded { loaded.game.flipped = self.flipped; self.dirty = true; self.edited = Instant::now(); }
-                }
+                // After the controls: `self.flip()` would clash with the borrowed replay.
+                flip = ui.button("Flip").on_hover_text("Flip the board (F)").clicked();
                 if ui.button("Copy FEN").on_hover_text(&fen).clicked() {
                     ctx.copy_text(fen.clone());
                     self.status = "Position copied".into();
@@ -2416,6 +2521,9 @@ impl App {
                     self.selected_square = pos.board().piece_at(square).filter(|p| p.color == pos.turn()).map(|_| square);
                 }
             }
+            if flip {
+                self.flip();
+            }
         });
     }
 }
@@ -2428,15 +2536,11 @@ impl eframe::App for App {
         {
             self.refresh(true);
         }
-        if self.dirty && self.edited.elapsed() > Duration::from_millis(700) {
-            self.save();
-            self.edited = Instant::now();
-        }
-        if self.dirty || self.search_due.is_some() {
+        if self.search_due.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if ctx.input(|i| i.viewport().close_requested())
-            && (!self.save() || self.importing || self.exporting)
+            && (!self.leave(Leave::Close) || self.importing || self.exporting)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.importing {
@@ -2787,6 +2891,89 @@ impl eframe::App for App {
             }
             if delete || cancel || modal.should_close() {
                 self.delete_game = None;
+            }
+        }
+        if let Some(id) = self.delete_from {
+            // The move, how many moves follow it, and whether they include the game's own.
+            let question = self.replay.as_ref().filter(|r| id < r.nodes.len()).map(|r| {
+                let (mut after, mut stack) = (0, r.nodes[id].children.clone());
+                while let Some(n) = stack.pop() {
+                    after += 1;
+                    stack.extend(&r.nodes[n].children);
+                }
+                (r.label(id), after, r.in_game(id))
+            });
+            let (mut delete, mut cancel) = (false, question.is_none());
+            if let Some((label, after, in_game)) = question {
+                let undo = self.play.is_none() && self.loaded.as_ref().is_some_and(|l| l.id >= 0);
+                let modal = egui::Modal::new(egui::Id::new("delete-from")).show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading(format!("Delete from {label}?"));
+                    ui.label(match after {
+                        0 => "This move is removed, with its note, marks and arrows.".to_owned(),
+                        1 => "This move and the one after it are removed, with their notes, marks and arrows.".to_owned(),
+                        n => format!("This move and the {n} after it are removed, with their notes, marks and arrows."),
+                    });
+                    if in_game {
+                        ui.label("These are the game's own moves; a game review is dropped.");
+                    }
+                    if undo {
+                        ui.small("Discard brings them back until you save.");
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        delete = ui
+                            .add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RIBBON).stroke(egui::Stroke::new(1.0_f32, RIBBON_LIGHT)))
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+                cancel |= modal.should_close();
+            }
+            if delete && let (Some(loaded), Some(replay)) = (&mut self.loaded, &self.replay) {
+                self.current = loaded.game.delete_line(replay, &mut loaded.notes, id).unwrap_or(0);
+                // Nodes renumber, so rebuild the tree and keep the board from gliding from the old number.
+                self.replay = loaded.game.replay().ok();
+                self.scrolled_node = None;
+                self.folded.clear();
+                self.board_position = Some((loaded.id, self.current));
+                self.dirty = true;
+            }
+            if delete || cancel {
+                self.delete_from = None;
+            }
+        }
+        if let Some(then) = self.leaving {
+            let (mut save, mut discard, mut cancel) = (false, false, false);
+            let modal = egui::Modal::new(egui::Id::new("unsaved")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Save changes to this game?");
+                ui.label("Your moves, lines and notes since the last save will be lost if you don't save them.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save = ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(GREEN)).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    discard = ui.button("Discard").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if discard {
+                self.discard();
+            }
+            // A failed save keeps the edits and the dialog closes with its error shown.
+            if (save && self.save()) || discard {
+                self.leaving = None;
+                match then {
+                    Leave::Select(id) => self.select(id),
+                    Leave::NewBoard => self.new_board(),
+                    Leave::Play(settings) => self.start_play(settings),
+                    Leave::Train(game) => self.start_training(game),
+                    Leave::Export(current) => self.export(current),
+                    Leave::LibraryFolder => self.choose_library_folder(ctx),
+                    Leave::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                }
+            } else if save || cancel || modal.should_close() {
+                self.leaving = None;
             }
         }
         if let Some((query, rows, highlight)) = &mut self.jump {
@@ -3166,6 +3353,8 @@ struct Sheet<'a> {
     next: usize,
     rebuild: bool,
     edited: bool,
+    /// "Delete from here" was chosen on this move; the app asks before deleting.
+    delete_from: Option<usize>,
 }
 
 /// One piece of the scoresheet, in reading order.
@@ -3484,10 +3673,7 @@ impl Sheet<'_> {
             let promotable = first != id && !replay.in_game(first) && node.position.is_some();
             let branches = replay.branches_to(id);
             let to_main = node.position.is_some() && !branches.is_empty();
-            let added = id >= self.first_added;
-            if promotable || to_main || added {
-                ui.separator();
-            }
+            ui.separator();
             // When this branch is the only one in the way, promoting it already makes the main line.
             if promotable && branches != [id] && ui.button("Promote variation").on_hover_text("Make this move the continuation of its line").clicked() {
                 loaded.game.promote(replay, id);
@@ -3499,10 +3685,9 @@ impl Sheet<'_> {
                 self.next = loaded.game.set_main_line(replay, &mut loaded.notes, id).unwrap_or(id);
                 self.rebuild = true;
             }
-            if added && ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
-                loaded.game.delete_line(replay, &mut loaded.notes, id);
-                self.next = parent;
-                self.rebuild = true;
+            if ui.button("Delete from here").on_hover_text("Remove this move and everything after it, with their notes").clicked() {
+                self.delete_from = Some(id);
+                ui.close();
             }
             if self.rebuild {
                 self.edited = true;

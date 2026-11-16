@@ -45,7 +45,7 @@ ChessLib command line (run with no arguments for the app). Every command prints 
   chesslib games promote ID NODE            make a variation the continuation of its line
   chesslib games main-line ID NODE          make NODE's line the main line, even over the game's own moves (they
                                             become a side line and nodes renumber); prints NODE's new number
-  chesslib games delete-line ID NODE        remove an added line from NODE on; later added nodes renumber
+  chesslib games delete-line ID NODE        remove NODE and every move after it; nodes renumber
   chesslib folders list                     game counts include subfolders
   chesslib folders create NAME [--parent FOLDER]
   chesslib folders rename FOLDER NAME
@@ -402,7 +402,7 @@ fn command(db: &mut Connection, path: &Path, args: &mut Args) -> Result<Value> {
             args.done()?;
             edit(db, id, |l| {
                 let (replay, n) = node(&l.game, n)?;
-                ensure!(l.game.delete_line(&replay, &mut l.notes, n), "Node {n} came with the imported game; only lines you added can be deleted");
+                l.game.delete_line(&replay, &mut l.notes, n).context("The starting position cannot be deleted")?;
                 Ok(())
             })?;
             json!({"ok": true})
@@ -687,7 +687,7 @@ mod tests {
         assert!(cli(db, "games show 1").unwrap()["moves"][4].get("drawings").is_none());
         assert!(cli(db, "games promote 1 4").is_err(), "the game's own 1... e5 stays first");
         assert!(cli(db, "games main-line 1 2").is_err(), "already the main line");
-        assert!(cli(db, "games delete-line 1 2").is_err(), "imported moves stay");
+        assert!(cli(db, "games delete-line 1 0").is_err(), "the starting position stays");
         cli(db, "games delete-line 1 4").unwrap();
         assert_eq!(cli(db, "games show 1").unwrap()["moves"].as_array().unwrap().len(), 4);
         cli(db, "games play 1 1 c5").unwrap();

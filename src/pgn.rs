@@ -237,10 +237,8 @@ impl Game {
         }
         let base = self.first_added(replay);
         let mut on_main = vec![false; replay.nodes.len()];
-        let mut ids = vec![None; replay.nodes.len()];
-        for (new, &old) in main.iter().enumerate() {
-            on_main[old] = true;
-            ids[old] = Some(new);
+        for &n in &main {
+            on_main[n] = true;
         }
         // The game's moves and the new main line become the PGN moves, the main line first at every branch.
         let order = |n: usize| {
@@ -248,26 +246,43 @@ impl Game {
             kids.sort_by_key(|&c| !on_main[c]);
             kids
         };
-        let mut next = main.len();
+        let ids = self.rewrite(replay, notes, &order, |_| true);
+        debug_assert_eq!(ids.iter().flatten().count(), replay.nodes.len());
+        self.review = None;
+        ids[id]
+    }
+
+    /// Writes the PGN moves anew, `order` giving each node's children with the continuation first, and keeps the added
+    /// moves `order` leaves out where `keep` allows; nodes renumber with what the reader keeps per node. Returns each
+    /// old node's new number, None for a dropped one.
+    fn rewrite(&mut self, replay: &Replay, notes: &mut Notes, order: &dyn Fn(usize) -> Vec<usize>, keep: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
+        let base = self.first_added(replay);
+        let mut ids = vec![None; replay.nodes.len()];
+        // The parser numbers the main line first.
+        let (mut node, mut next) = (0, 1);
+        ids[0] = Some(0);
+        while let Some(&child) = order(node).first() {
+            ids[child] = Some(next);
+            next += 1;
+            node = child;
+        }
         let mut tokens = replay.nodes[0].annotations.clone();
-        write_tokens(replay, &order, 0, &mut ids, &mut next, &mut tokens);
+        write_tokens(replay, order, 0, &mut ids, &mut next, &mut tokens);
         let moves_end = next;
         let mut study = Vec::new();
         for (i, movement) in self.study.iter().enumerate() {
-            if ids[base + i].is_none() {
+            if ids[base + i].is_none() && keep(base + i) {
                 ids[base + i] = Some(next);
                 next += 1;
                 study.push(StudyMove { parent: ids[movement.parent].unwrap(), san: movement.san.clone() });
             }
         }
-        debug_assert_eq!(next, replay.nodes.len());
         self.tokens = tokens;
         self.study = study;
         self.renumber(notes, |old| ids[old]);
         // Orders among the game's moves are now written into them.
         self.promoted.retain(|_, child| *child >= moves_end);
-        self.review = None;
-        ids[id]
+        ids
     }
 
     /// Moves what the reader keeps per node to the node's new number; `map` gives None for a removed node.
@@ -280,11 +295,25 @@ impl Game {
         self.promoted = std::mem::take(&mut self.promoted).into_iter().filter_map(|(p, c)| Some((map(p)?, map(c)?))).collect();
     }
 
-    /// Removes an added line from `id` onward, with its notes, marks and drawings; IDs of later added moves shift down.
-    pub fn delete_line(&mut self, replay: &Replay, notes: &mut Notes, id: usize) -> bool {
+    /// Removes `id` and every move after it, with their notes, marks and drawings, and returns its parent's new node;
+    /// None for the starting position. Deleting a game move rewrites the game: the next side line there, if any, continues
+    /// it, nodes renumber, and a whole-game review, which no longer fits, is dropped. Deleting an added line only shifts
+    /// later added moves down.
+    pub fn delete_line(&mut self, replay: &Replay, notes: &mut Notes, id: usize) -> Option<usize> {
+        let parent = replay.nodes[id].parent?;
         let base = self.first_added(replay);
         if id < base {
-            return false;
+            let mut removed = vec![false; replay.nodes.len()];
+            let mut stack = vec![id];
+            while let Some(n) = stack.pop() {
+                removed[n] = true;
+                stack.extend(&replay.nodes[n].children);
+            }
+            if replay.in_game(id) {
+                self.review = None;
+            }
+            let order = |n: usize| replay.nodes[n].children.iter().copied().filter(|&c| c < base && !removed[c]).collect();
+            return self.rewrite(replay, notes, &order, |n| !removed[n])[parent];
         }
         let mut removed = std::collections::BTreeSet::from([id]);
         // Study moves come after their parents, so one forward pass collects the whole subtree.
@@ -311,7 +340,7 @@ impl Game {
             movement.parent = remap(movement.parent).unwrap();
         }
         self.renumber(notes, remap);
-        true
+        Some(parent)
     }
 
     pub fn mainline_positions(&self) -> Result<Vec<(usize, Chess)>> {
@@ -906,8 +935,8 @@ mod tests {
         assert!(!game.promote(&replay, d5), "the game's own move stays first");
         let replay = game.replay().unwrap();
         assert_eq!(replay.nodes[d5].children, vec![nc3, exd5]);
-        assert!(!game.delete_line(&replay, &mut notes, 4), "imported c5 stays");
-        assert!(game.delete_line(&replay, &mut notes, d5));
+        assert_eq!(game.delete_line(&replay, &mut notes, 0), None, "the starting position stays");
+        assert_eq!(game.delete_line(&replay, &mut notes, d5), Some(1));
         let replay = game.replay().unwrap();
         assert_eq!(game.study.len(), 1);
         assert_eq!(replay.nodes[d5].san, "d4", "later added moves shift into the freed IDs");
@@ -916,6 +945,35 @@ mod tests {
         assert_eq!(game.position_labels.keys().copied().collect::<Vec<_>>(), vec![d5], "position tags follow their move");
         assert!(game.promoted.is_empty());
         assert!(!game.export(&notes).unwrap().contains("d5"));
+    }
+
+    #[test]
+    fn delete_game_moves_and_imported_lines() {
+        // 0 start, 1 e4, 2 e5, 3 Nf3, 4 Nc6, then the side line 5 c5, 6 Nf3.
+        let fresh = || {
+            let mut game = parse("1. e4 e5 (1... c5 2. Nf3) 2. Nf3 Nc6 *");
+            let mut replay = game.replay().unwrap();
+            let d6 = play_san(&mut game, &mut replay, 6, "d6");
+            game.review = parse("1. e4 { [%eval 0.18] } *").pgn_review();
+            let notes = Notes::from([(2, "e5".into()), (4, "Nc6".into()), (5, "c5".into()), (d6, "d6".into())]);
+            (game.replay().unwrap(), game, notes)
+        };
+        let (replay, mut game, mut notes) = fresh();
+        assert_eq!(game.delete_line(&replay, &mut notes, 5), Some(1), "an imported side line, with what was added to it");
+        let replay = game.replay().unwrap();
+        assert_eq!(replay.nodes.len(), 5);
+        assert!(game.study.is_empty());
+        assert_eq!(notes, Notes::from([(2, "e5".into()), (4, "Nc6".into())]));
+        assert!(game.review.is_some(), "the game's moves are untouched");
+        assert!(!game.export(&notes).unwrap().contains("c5"));
+
+        let (replay, mut game, mut notes) = fresh();
+        assert_eq!(game.delete_line(&replay, &mut notes, 2), Some(1), "the game's own 1... e5");
+        let replay = game.replay().unwrap();
+        assert_eq!(replay.line(0).iter().map(|&n| replay.nodes[n].san.as_str()).collect::<Vec<_>>(), ["", "e4", "c5", "Nf3"], "the side line continues the game");
+        assert_eq!((replay.nodes[4].san.as_str(), replay.nodes[4].parent), ("d6", Some(3)), "the added move stays added, after it");
+        assert_eq!(notes, Notes::from([(2, "c5".into()), (4, "d6".into())]), "notes follow their moves");
+        assert!(game.review.is_none());
     }
 
     #[test]
